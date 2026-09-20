@@ -1,0 +1,214 @@
+name: WORLD SITUATION ROOM - ANDROID APK R2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/00-WORLD-SITUATION-ROOM-ANDROID-APK-R2.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: world-situation-room-android-r2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-apk:
+    name: Build installable Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Restore embedded Android project
+        shell: bash
+        env:
+          EXPECTED_SHA256: f463289b7a496edf127006b06baf11264eed908b5c336ebf530b0daf217c09ca
+        run: |
+          set -euo pipefail
+
+          PROJECT_ARCHIVE="${RUNNER_TEMP}/world-situation-room-android-r2.tar.gz"
+          PROJECT_PARENT="${RUNNER_TEMP}/world-situation-room-build"
+          mkdir -p "${PROJECT_PARENT}"
+
+          base64 --decode > "${PROJECT_ARCHIVE}" <<'WORLD_SITUATION_ROOM_ANDROID_R2'
+          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
+          WORLD_SITUATION_ROOM_ANDROID_R2
+
+          printf '%s  %s\n' "${EXPECTED_SHA256}" "${PROJECT_ARCHIVE}" | sha256sum --check
+          tar -xzf "${PROJECT_ARCHIVE}" -C "${PROJECT_PARENT}"
+          printf 'PROJECT_DIR=%s\n' "${PROJECT_PARENT}/android-cradle-r2" >> "${GITHUB_ENV}"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android platform 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.9"
+
+      - name: Compile Android application
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_DIR}"
+          gradle --no-daemon --stacktrace --warning-mode all :app:assembleDebug
+
+      - name: Prepare the installable APK
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUTPUT_DIR="${RUNNER_TEMP}/world-situation-room-apk"
+          OUTPUT_APK="${OUTPUT_DIR}/World-Situation-Room-R2.apk"
+          SOURCE_APK="${PROJECT_DIR}/app/build/outputs/apk/debug/app-debug.apk"
+
+          mkdir -p "${OUTPUT_DIR}"
+          install -m 0644 "${SOURCE_APK}" "${OUTPUT_APK}"
+          test -s "${OUTPUT_APK}"
+
+          APK_SHA256="$(sha256sum "${OUTPUT_APK}" | awk '{print $1}')"
+          APK_SIZE="$(du -h "${OUTPUT_APK}" | awk '{print $1}')"
+          {
+            echo "## Android APK ready"
+            echo
+            echo "- File: World-Situation-Room-R2.apk"
+            echo "- Package: com.sentongoharuna.worldsituationroom"
+            echo "- Version: 2.0 (2)"
+            echo "- Minimum Android: 6.0 (API 23)"
+            echo "- Size: ${APK_SIZE}"
+            echo "- SHA-256: ${APK_SHA256}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/world-situation-room-apk/World-Situation-Room-R2.apk
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
