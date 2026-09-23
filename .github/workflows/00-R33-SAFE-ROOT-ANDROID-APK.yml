@@ -1,0 +1,136 @@
+name: DEVELOP.UGANDA World Monitor R33 Safe Root APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/00-R33-SAFE-ROOT-ANDROID-APK.yml"
+      - "app/**"
+      - "scripts/**"
+permissions:
+  contents: read
+concurrency:
+  group: du-r33-safe-root-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: Build R33 Safe Native Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate native Android app
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "app/build.gradle.kts" || -f "app/build.gradle" ]]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "Native Android app module found at repository root: app/"
+          elif [[ -f "world-situation-room-native-r30/app/build.gradle.kts" || -f "world-situation-room-native-r30/app/build.gradle" ]]; then
+            echo "PROJECT_DIR=world-situation-room-native-r30" >> "$GITHUB_ENV"
+            echo "Native Android project found in world-situation-room-native-r30/"
+          else
+            echo "::error::No Android app/build.gradle(.kts) found."
+            exit 1
+          fi
+
+      - name: Prepare missing root Gradle settings safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [[ ! -f settings.gradle.kts && ! -f settings.gradle ]]; then
+            printf '%s\n' \
+              'pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }' \
+              'dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }' \
+              'rootProject.name = "DevelopUgandaWorldMonitor"' \
+              'include(":app")' > settings.gradle.kts
+          fi
+          test -f app/src/main/AndroidManifest.xml
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Verify available R33 contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          shopt -s nullglob
+          checks=(scripts/verify-r33*.sh)
+          for check in "${checks[@]}"; do
+            chmod +x "$check"
+            echo "Running $check"
+            "$check" "$(pwd)"
+          done
+
+      - name: Lint compile and assemble R33
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [[ -x ./gradlew ]]; then
+            ./gradlew --no-daemon :app:lintDebug :app:assembleDebug
+          else
+            gradle --no-daemon :app:lintDebug :app:assembleDebug
+          fi
+
+      - name: Verify and stage APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk" -type f -name '*.apk' | sort)
+          (( ${#APKS[@]} > 0 )) || { echo "::error::No APK produced."; exit 1; }
+          APK="${APKS[0]}"
+          for f in "${APKS[@]}"; do
+            [[ "$f" == *"/debug/"* ]] && { APK="$f"; break; }
+          done
+          mkdir -p "$RUNNER_TEMP/du-r33"
+          OUT="$RUNNER_TEMP/du-r33/DEVELOP-UGANDA-WORLD-MONITOR-R33.apk"
+          cp "$APK" "$OUT"
+          test -s "$OUT"
+          sha256sum "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(stat -c%s "$OUT")" >> "$GITHUB_OUTPUT"
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo "## DEVELOP.UGANDA WORLD MONITOR R33"
+            echo ""
+            echo "Safe repository-source build completed."
+            echo "- APK: DEVELOP-UGANDA-WORLD-MONITOR-R33.apk"
+            echo "- Size: ${{ steps.apk.outputs.bytes }} bytes"
+            echo "- No embedded source payload"
+            echo "- No CI source/version rewriting"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload R33 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-uganda-world-monitor-R33-safe-${{ github.run_number }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
