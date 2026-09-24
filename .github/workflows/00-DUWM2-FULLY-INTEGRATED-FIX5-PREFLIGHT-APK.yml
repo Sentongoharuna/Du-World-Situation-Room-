@@ -1,0 +1,109 @@
+name: DUWM2 FULLY INTEGRATED FIX5 PREFLIGHT APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/00-DUWM2-FULLY-INTEGRATED-FIX5-PREFLIGHT-APK.yml"
+      - "DUWM2-FULLY-INTEGRATED-FIX5-PREFLIGHT-SOURCE.tar.gz"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duwm2-fix5-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract and verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s DUWM2-FULLY-INTEGRATED-FIX5-PREFLIGHT-SOURCE.tar.gz
+          echo "44683cc9d821493df6011793b1fbd1fd1f410d4bda43db310dc628b9eb61139d  DUWM2-FULLY-INTEGRATED-FIX5-PREFLIGHT-SOURCE.tar.gz" | sha256sum -c -
+          rm -rf "$RUNNER_TEMP/duwm2"; mkdir -p "$RUNNER_TEMP/duwm2"
+          tar -xzf DUWM2-FULLY-INTEGRATED-FIX5-PREFLIGHT-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm2"
+          echo "PROJECT_DIR=$RUNNER_TEMP/duwm2" >> "$GITHUB_ENV"
+
+      - name: Full static preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x scripts/verify-duwm2-current-build.sh scripts/verify-duwm2-fix4-compile-contract.sh scripts/verify-duwm2-fix5-preflight.sh
+          scripts/verify-duwm2-current-build.sh "$PROJECT_DIR"
+          scripts/verify-duwm2-fix4-compile-contract.sh "$PROJECT_DIR"
+          scripts/verify-duwm2-fix5-preflight.sh "$PROJECT_DIR"
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Use runner Android 36 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK/platforms/android-36"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Java compile gate
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.configuration-cache=false
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:compileDebugJavaWithJavac --stacktrace
+
+      - name: Android resource and manifest gate
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.configuration-cache=false
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:processDebugResources :app:processDebugMainManifest --stacktrace
+
+      - name: Lint and assemble
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.configuration-cache=false
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:lintDebug :app:assembleDebug --stacktrace
+
+      - name: Verify and stage APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -name '*.apk' -type f | head -1)"
+          test -n "$APK"; test -s "$APK"
+          cp "$APK" "$RUNNER_TEMP/DUWM2-FULLY-INTEGRATED-FIX5.apk"
+          sha256sum "$RUNNER_TEMP/DUWM2-FULLY-INTEGRATED-FIX5.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM2-FULLY-INTEGRATED-FIX5-APK
+          path: ${{ runner.temp }}/DUWM2-FULLY-INTEGRATED-FIX5.apk
+          if-no-files-found: error
+          retention-days: 14
