@@ -1,0 +1,93 @@
+name: DUWM2 FULLY INTEGRATED FIX3 ANDROIDX APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/00-DUWM2-FULLY-INTEGRATED-FIX3-ANDROIDX-APK.yml"
+      - "DUWM2-FULLY-INTEGRATED-FIX3-ANDROIDX-SOURCE.tar.gz"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duwm2-fix3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify and extract FIX3 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s DUWM2-FULLY-INTEGRATED-FIX3-ANDROIDX-SOURCE.tar.gz
+          echo "8bcb245b4d9c118460eb96d68d4b415300c418c237661e09e89ec03b23c6d81c  DUWM2-FULLY-INTEGRATED-FIX3-ANDROIDX-SOURCE.tar.gz" | sha256sum -c -
+          rm -rf "$RUNNER_TEMP/duwm2"
+          mkdir -p "$RUNNER_TEMP/duwm2"
+          tar -xzf DUWM2-FULLY-INTEGRATED-FIX3-ANDROIDX-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm2"
+          echo "PROJECT_DIR=$RUNNER_TEMP/duwm2" >> "$GITHUB_ENV"
+
+      - name: Verify current integrated app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          grep -Fx 'android.useAndroidX=true' gradle.properties
+          grep -Fx 'org.gradle.configuration-cache=false' gradle.properties
+          chmod +x scripts/verify-duwm2-current-build.sh
+          scripts/verify-duwm2-current-build.sh "$PROJECT_DIR"
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Locate runner Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK/platforms/android-36"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Clean lint compile assemble
+        shell: bash
+        env:
+          GRADLE_OPTS: -Dorg.gradle.configuration-cache=false
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache clean :app:lintDebug :app:assembleDebug --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -name '*.apk' -type f | head -1)"
+          test -n "$APK"
+          test -s "$APK"
+          cp "$APK" "$RUNNER_TEMP/DUWM2-FULLY-INTEGRATED-FIX3.apk"
+
+      - name: Upload DUWM2 FIX3 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM2-FULLY-INTEGRATED-FIX3-APK
+          path: ${{ runner.temp }}/DUWM2-FULLY-INTEGRATED-FIX3.apk
+          if-no-files-found: error
+          retention-days: 14
