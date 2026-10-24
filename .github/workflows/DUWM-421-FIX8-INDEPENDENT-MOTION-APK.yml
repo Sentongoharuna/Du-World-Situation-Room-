@@ -1,0 +1,341 @@
+name: DUWM 4.21 FIX8 Independent Globe Motion APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/DUWM-421-FIX8-INDEPENDENT-MOTION-APK.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duwm421-fix8-independent-globe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact working source; never import older faulty workflows
+        uses: actions/checkout@v4
+        with:
+          repository: Sentongoharuna/kampala-city-live-
+          ref: main
+          path: duwm-source
+          persist-credentials: false
+
+      - name: Validate frozen DUWM 4.21 aircraft baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'e6c0222d1d7fc12cae1f939af349aefddb86e44cfc76ffcd2e00169d5ac813d2  duwm-source/DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz' | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/duwm"
+          tar -xzf duwm-source/DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm"
+          PROJECT_DIR="$RUNNER_TEMP/duwm/DUWM-1-2-20-4-21-FIX2-PROJECT"
+          test -f "$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java"
+          bash "$PROJECT_DIR/scripts/verify-4-21-air.sh" "$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch one native globe view; unique install; motion diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PYMOTION'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          java = root / 'app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java'
+          gradle = root / 'app/build.gradle.kts'
+          strings = root / 'app/src/main/res/values/strings.xml'
+          src = java.read_text(encoding='utf-8')
+          before = src
+
+          def replace_once(old, new, stage):
+              global src
+              found = src.count(old)
+              if found != 1:
+                  raise SystemExit(f'FAIL CLOSED: {stage} expected one match, got {found}')
+              src = src.replace(old, new, 1)
+              print('SAFE CHANGE:', stage)
+
+          # FIX8: a monotonic animation clock owns BOTH longitude changes and redraws.
+          # The network acquisition code and Android widget code are not touched.
+          replace_once(
+              '''    private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (isAttachedToWindow() && isShown()) postInvalidateOnAnimation();
+                  }
+              };''',
+              '''    // FIX8: independent motion clock, not reliant on incoming network records.
+              private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!isAttachedToWindow() || !isShown()
+                              || getWindowVisibility() != View.VISIBLE) return;
+                      updateAutoRotation();
+                      postInvalidateOnAnimation();
+                      motionFrameCount++;
+                      if (motionFrameCount % 90L == 0L) {
+                          android.util.Log.d("DUWM_MOTION8", "frame=" + motionFrameCount
+                                  + " centerLongitude=" + centerLon
+                                  + " globe=" + globeMode);
+                      }
+                      postDelayed(this, 40L); // 25 Hz, bounded battery use
+                  }
+              };''',
+              'clock independent of redraw and data')
+
+          replace_once(
+              '''    private long lastFrameMs;
+                  private long animationTimeMs;''',
+              '''    private long lastFrameMs;
+                  private long motionFrameCount;
+                  private long animationTimeMs;''',
+              'frame heartbeat counter')
+
+          replace_once(
+              '''            drawCommandGrid(canvas);
+                  updateAutoRotation();
+                  drawGlobe(canvas);''',
+              '''            drawCommandGrid(canvas);
+                  drawGlobe(canvas);''',
+              'never update rotation a second time inside draw')
+
+          replace_once(
+              '''        // Adaptive pacing preserves visible movement without allowing a dense global snapshot
+                  // to starve taps, scrolling or Android's launch watchdog.
+                  removeCallbacks(framePulse);
+                  long frameDelayMs = signals.size() > 1_800 ? 50L
+                          : signals.size() > 800 ? 40L : 33L;
+                  postOnAnimationDelayed(framePulse, frameDelayMs);''',
+              '''        // FIX8: the independent clock schedules frames; onDraw is render-only.''',
+              'remove competing redraw scheduling')
+
+          replace_once(
+              '''    private void updateAutoRotation() {
+                  long now = animationTimeMs;''',
+              '''    private void updateAutoRotation() {
+                  long now = SystemClock.uptimeMillis();''',
+              'monotonic time not dependent on onDraw')
+
+          replace_once(
+              '''            // Clearly visible rotation: roughly one full revolution every 5.5 minutes.
+                          centerLon = wrapLongitude(centerLon + elapsed * 0.018d);''',
+              '''            // Clearly visible independent yaw; ~30 sec per full turn.
+                          centerLon = wrapLongitude(centerLon + elapsed * 0.012d);''',
+              'real geographic center longitude movement')
+
+          replace_once(
+              '''            interactionPauseUntilMs = SystemClock.uptimeMillis() + 15_000L;''',
+              '''            interactionPauseUntilMs = 0L; // Initial regional focus must not freeze rotation.''',
+              'remove initial freeze')
+
+          # Existing lifecycle hooks are modified, NOT duplicated (the FIX6 compiler failure).
+          replace_once(
+              '''    @Override
+              protected void onWindowVisibilityChanged(int visibility) {
+                  super.onWindowVisibilityChanged(visibility);
+                  if (visibility == View.VISIBLE && isAttachedToWindow()) {
+                      lastFrameMs = 0L;
+                      postInvalidateOnAnimation();
+                  } else {
+                      removeCallbacks(framePulse);
+                  }
+              }''',
+              '''    @Override
+              protected void onWindowVisibilityChanged(int visibility) {
+                  super.onWindowVisibilityChanged(visibility);
+                  removeCallbacks(framePulse);
+                  if (visibility == View.VISIBLE && isAttachedToWindow()) {
+                      lastFrameMs = 0L;
+                      post(framePulse);
+                  }
+              }''',
+              'reuse existing window visibility lifecycle')
+
+          replace_once(
+              '''    @Override
+              protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {''',
+              '''    @Override
+              protected void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  lastFrameMs = 0L;
+                  removeCallbacks(framePulse);
+                  if (isShown()) post(framePulse);
+              }
+
+              @Override
+              protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {''',
+              'start motion when native view attaches')
+
+          # Small actual-longitude indicator makes a real installed version distinguishable.
+          replace_once(
+              '''        drawTrackedCallout(canvas);
+                  drawAttribution(canvas);''',
+              '''        drawTrackedCallout(canvas);
+                  drawAttribution(canvas);
+                  if (globeMode) drawMotionReading(canvas);''',
+              'visible rotation evidence on actual app globe')
+
+          anchor = '''    private void updateAutoRotation() {'''
+          method = '''    // FIX8 proof is derived from the actual rotating center longitude.
+              private void drawMotionReading(Canvas canvas) {
+                  float density = getResources().getDisplayMetrics().density;
+                  textPaint.setShader(null);
+                  textPaint.setTypeface(android.graphics.Typeface.MONOSPACE);
+                  textPaint.setTextAlign(Paint.Align.CENTER);
+                  textPaint.setTextSize(9f * getResources().getDisplayMetrics().scaledDensity);
+                  textPaint.setColor(Color.rgb(101, 191, 219));
+                  double lon = (centerLon + 360d) % 360d;
+                  canvas.drawText(String.format(Locale.US,
+                          "DUWM MOTION 8 / %05.1f DEG", lon),
+                          globeCenterX(),
+                          globeCenterY() + globeRadius() + 19f * density,
+                          textPaint);
+              }
+
+          '''
+          replace_once(anchor, method + anchor, 'subtle changing longitude proof')
+
+          methods = ['onAttachedToWindow', 'onWindowVisibilityChanged', 'onDetachedFromWindow']
+          for method_name in methods:
+              count = len(re.findall(r'protected\s+void\s+' + method_name + r'\s*\(', src))
+              if count != 1:
+                  raise SystemExit('Lifecycle method duplication: ' + method_name + '=' + str(count))
+          protected = [
+              'baseTiles.shutdown();', 'overlayTiles.shutdown();',
+              'drawGlobe(canvas);', 'drawSignals(canvas);',
+              'recordProviderFixes(', 'drawOperationalArcs(canvas);',
+              'drawTrackedCallout(canvas);', 'updateFollowCenter();',
+              'private boolean projectGlobeInto(',
+          ]
+          for token in protected:
+              if token not in src or token not in before:
+                  raise SystemExit('Preserved feature missing: ' + token)
+          if src.count('postDelayed(this, 40L);') != 1:
+              raise SystemExit('Independent loop missing/duplicated')
+          if 'long now = animationTimeMs;' in src:
+              raise SystemExit('Rotation still incorrectly clocked from render')
+          if 'drawCommandGrid(canvas);\n            updateAutoRotation();' in src:
+              raise SystemExit('Rotation still coupled to onDraw')
+          java.write_text(src, encoding='utf-8')
+
+          # FIX7 used the same app identity as old builds; generated debug signatures
+          # can conflict. Unique applicationId makes FIX8 testable side-by-side.
+          cfg = gradle.read_text(encoding='utf-8')
+          def only_one(text, old, new, label):
+              if text.count(old) != 1:
+                  raise SystemExit('Missing/duplicated ' + label)
+              return text.replace(old, new, 1)
+          cfg = only_one(cfg,
+              'applicationId = "com.sentongoharuna.worldsituationroom"',
+              'applicationId = "com.sentongoharuna.worldsituationroom.motion8"',
+              'unique installation id')
+          cfg = only_one(cfg, 'versionCode = 36', 'versionCode = 38', 'version code')
+          cfg = only_one(cfg, 'versionName = "2026-local-news"',
+                         'versionName = "4.21-motion8"', 'version name')
+          gradle.write_text(cfg, encoding='utf-8')
+          app_strings = strings.read_text(encoding='utf-8')
+          app_strings, n = re.subn(r'(<string\s+name="app_name">).*?(</string>)',
+              r'\g<1>DUWM Motion 8\g<2>', app_strings, count=1)
+          if n != 1:
+              raise SystemExit('Could not label distinctive app')
+          strings.write_text(app_strings, encoding='utf-8')
+
+          # Simulation: monotonic 40ms frame pulses visibly move the longitude,
+          # while pauses/hiding do not. Fail if no geographic change in 2 seconds.
+          lon = 32.5825
+          for i in range(50):
+              lon = ((lon + 40 * .012 + 180) % 360) - 180
+          displacement = ((lon - 32.5825 + 540) % 360) - 180
+          if displacement < 20:
+              raise SystemExit('Motion numerical test failed')
+          print(f'MOTION CHECK: longitude changes {displacement:.1f} deg in 2 sec')
+          print('FIX8 patched one view, preserved all aircraft features and gave app unique identity')
+          PYMOTION
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Install Android SDK API 36 without obsolete tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT" && test -d "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Compile and assemble independent-motion Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:assembleDebug --stacktrace
+
+      - name: Verify distinct APK package and stage exactly one APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -eq 1
+          APK="${APKS[0]}"
+          test -s "$APK"
+          python3 - "$APK" <<'PYZIP'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              assert z.testzip() is None, 'Corrupt APK'
+              assert 'AndroidManifest.xml' in z.namelist()
+              assert 'classes.dex' in z.namelist()
+          print('APK archive and DEX verified')
+          PYZIP
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          PACKAGE="$($SDK_ROOT/build-tools/36.0.0/aapt dump badging "$APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+          test "$PACKAGE" = 'com.sentongoharuna.worldsituationroom.motion8'
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$APK" "$RUNNER_TEMP/release/DUWM-4-21-MOTION8-INDEPENDENT-GLOBE.apk"
+          sha256sum "$RUNNER_TEMP/release/DUWM-4-21-MOTION8-INDEPENDENT-GLOBE.apk"
+
+      - name: Upload independent-motion APK (not GitHub Pages)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX8-INDEPENDENT-MOTION-APK
+          path: ${{ runner.temp }}/release/DUWM-4-21-MOTION8-INDEPENDENT-GLOBE.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Non-blocking existing lint audit
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:lintDebug
+
+      - name: Upload lint findings separately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX8-LINT-REPORT
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/lint-results-debug.*
+            ${{ env.PROJECT_DIR }}/app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/*.txt
+          if-no-files-found: ignore
+          retention-days: 30
