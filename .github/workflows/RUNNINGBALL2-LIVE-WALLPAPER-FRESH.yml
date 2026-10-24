@@ -1,0 +1,210 @@
+name: RUNNINGBALL2 LIVE WALLPAPER
+run-name: "RUNNINGBALL2 LIVE WALLPAPER #${{ github.run_number }}"
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/runningball2-live-wallpaper.yml"
+      - "DUWM-1-2-20-2-20-FULL-REGRESSION-FIX2-SOURCE.tar.gz"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact source
+        run: |
+          set -euo pipefail
+          echo "1be8caba512b4fa2430f636fcfc6a4a73a1a484a9d3b64e829f3d3a606e7d32a  DUWM-1-2-20-2-20-FULL-REGRESSION-FIX2-SOURCE.tar.gz" | sha256sum -c -
+      - name: Extract
+        run: |
+          mkdir -p "$RUNNER_TEMP/duwm"
+          tar -xzf DUWM-1-2-20-2-20-FULL-REGRESSION-FIX2-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm"
+          echo "PROJECT_DIR=$RUNNER_TEMP/duwm/world-situation-room-native-1-2-20-2-20" >> "$GITHUB_ENV"
+      - name: Full source-to-Globe regression gate
+        run: |
+          chmod +x "$PROJECT_DIR/scripts/"*.sh
+          "$PROJECT_DIR/scripts/verify-1-2-20-2-20-full-regression.sh" "$PROJECT_DIR"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+          cache-disabled: true
+      - name: RUNNINGBALL2 add live wallpaper mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          RES="$PROJECT_DIR/app/src/main/res"
+          MANIFEST="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -s "$PKG/SatelliteMapView.java"
+          test -s "$MANIFEST"
+          GLOBE_BEFORE="$(sha256sum "$PKG/SatelliteMapView.java" | awk '{print $1}')"
+          mkdir -p "$RES/xml" "$RES/values"
+
+          cat > "$PKG/DuwmLiveWallpaperService.java" <<'JAVA'
+          package com.sentongoharuna.worldsituationroom;
+          import android.service.wallpaper.WallpaperService;
+          import android.view.SurfaceHolder;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.Color;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+
+          public final class DuwmLiveWallpaperService extends WallpaperService {
+            @Override public Engine onCreateEngine(){ return new GlobeEngine(); }
+            private final class GlobeEngine extends Engine {
+              private final Handler ui=new Handler(Looper.getMainLooper());
+              private final Paint earth=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint grid=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint accent=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private boolean visible=false, pending=false;
+              private long lastMs=0L;
+              private double rotation=0.0d;
+              private static final long FRAME_MS=33L;
+
+              private final Runnable tick=new Runnable(){
+                @Override public void run(){
+                  pending=false;
+                  if(!visible)return;
+                  long now=SystemClock.uptimeMillis();
+                  long dt=lastMs==0L?FRAME_MS:Math.min(100L,Math.max(0L,now-lastMs));
+                  lastMs=now;
+                  rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;
+                  drawGlobe();
+                  schedule();
+                }
+              };
+
+              GlobeEngine(){
+                earth.setColor(Color.rgb(5,18,31)); earth.setStyle(Paint.Style.FILL);
+                grid.setColor(Color.argb(95,58,185,220)); grid.setStyle(Paint.Style.STROKE); grid.setStrokeWidth(1.2f);
+                accent.setColor(Color.rgb(58,220,132)); accent.setStyle(Paint.Style.STROKE); accent.setStrokeWidth(2f);
+              }
+              private void schedule(){ if(!visible||pending)return; pending=true; ui.postDelayed(tick,FRAME_MS); }
+              private void stop(){ visible=false; pending=false; ui.removeCallbacks(tick); }
+              @Override public void onVisibilityChanged(boolean v){ visible=v; if(v){lastMs=0L;schedule();}else stop(); }
+              @Override public void onSurfaceChanged(SurfaceHolder h,int f,int w,int x){super.onSurfaceChanged(h,f,w,x);if(visible)drawGlobe();}
+              @Override public void onSurfaceDestroyed(SurfaceHolder h){stop();super.onSurfaceDestroyed(h);}
+              @Override public void onDestroy(){stop();super.onDestroy();}
+
+              private void drawGlobe(){
+                SurfaceHolder h=getSurfaceHolder(); Canvas c=null;
+                try{
+                  c=h.lockCanvas(); if(c==null)return; c.drawColor(Color.BLACK);
+                  float w=c.getWidth(), ht=c.getHeight(), cx=w*.5f, cy=ht*.48f, r=Math.min(w,ht)*.34f;
+                  c.drawCircle(cx,cy,r,earth);
+                  for(int lat=-60;lat<=60;lat+=30){
+                    float y=cy-(float)Math.sin(Math.toRadians(lat))*r;
+                    float rx=(float)(Math.cos(Math.toRadians(lat))*r);
+                    c.drawOval(cx-rx,y-r*.08f,cx+rx,y+r*.08f,grid);
+                  }
+                  for(int lon=0;lon<180;lon+=30){
+                    double a=Math.toRadians(lon+rotation); float rx=(float)(Math.abs(Math.cos(a))*r);
+                    c.drawOval(cx-rx,cy-r,cx+rx,cy+r,grid);
+                  }
+                  double a=Math.toRadians(rotation);
+                  c.drawCircle(cx+(float)Math.cos(a)*r,cy+(float)Math.sin(a)*r*.25f,7f,accent);
+                } finally { if(c!=null)h.unlockCanvasAndPost(c); }
+              }
+            }
+          }
+          JAVA
+
+          cat > "$PKG/LiveWallpaperLauncherActivity.java" <<'JAVA'
+          package com.sentongoharuna.worldsituationroom;
+          import android.app.Activity;
+          import android.app.WallpaperManager;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.os.Bundle;
+          public final class LiveWallpaperLauncherActivity extends Activity {
+            @Override protected void onCreate(Bundle b){
+              super.onCreate(b);
+              Intent i=new Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER);
+              i.putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,new ComponentName(this,DuwmLiveWallpaperService.class));
+              try{startActivity(i);}catch(Throwable t){startActivity(new Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER));}
+              finish();
+            }
+          }
+          JAVA
+
+          cat > "$RES/xml/duwm_live_wallpaper.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <wallpaper xmlns:android="http://schemas.android.com/apk/res/android"
+            android:description="@string/duwm_live_wallpaper_description" />
+          XML
+
+          cat > "$RES/values/duwm_live_wallpaper_strings.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <string name="duwm_live_wallpaper_name">DU World Monitor Live Globe</string>
+            <string name="duwm_live_wallpaper_description">Live rotating DU World Monitor globe wallpaper.</string>
+          </resources>
+          XML
+
+          python3 - "$MANIFEST" <<'PY'
+          import pathlib,sys
+          p=pathlib.Path(sys.argv[1]); s=p.read_text()
+          if 'DuwmLiveWallpaperService' not in s:
+              at=s.rfind('</application>')
+              if at<0: raise SystemExit("application close tag missing")
+              block='''\
+              <service android:name=".DuwmLiveWallpaperService" android:exported="true"
+                android:label="@string/duwm_live_wallpaper_name"
+                android:permission="android.permission.BIND_WALLPAPER">
+                <intent-filter><action android:name="android.service.wallpaper.WallpaperService" /></intent-filter>
+                <meta-data android:name="android.service.wallpaper" android:resource="@xml/duwm_live_wallpaper" />
+              </service>
+              <activity android:name=".LiveWallpaperLauncherActivity" android:exported="false" />
+              '''
+              p.write_text(s[:at]+block+s[at:])
+          PY
+
+          GLOBE_AFTER="$(sha256sum "$PKG/SatelliteMapView.java" | awk '{print $1}')"
+          test "$GLOBE_BEFORE" = "$GLOBE_AFTER"
+          echo "RUNNINGBALL2 WORKING GLOBE SOURCE PRESERVED"
+
+      - name: RUNNINGBALL2 wallpaper acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          MANIFEST="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -s "$PKG/DuwmLiveWallpaperService.java"
+          test -s "$PKG/LiveWallpaperLauncherActivity.java"
+          grep -Fq "FRAME_MS=33L" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "if(!visible||pending)return" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "ui.removeCallbacks(tick)" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "ACTION_CHANGE_LIVE_WALLPAPER" "$PKG/LiveWallpaperLauncherActivity.java"
+          grep -Fq "android.permission.BIND_WALLPAPER" "$MANIFEST"
+          echo "RUNNINGBALL2 LIVE WALLPAPER ACCEPTANCE PASS"
+
+      - name: Compile
+        run: cd "$PROJECT_DIR" && gradle --no-daemon --no-configuration-cache :app:compileDebugJavaWithJavac --stacktrace
+      - name: Lint
+        run: cd "$PROJECT_DIR" && gradle --no-daemon --no-configuration-cache :app:lintDebug --stacktrace
+      - name: Assemble
+        run: cd "$PROJECT_DIR" && gradle --no-daemon --no-configuration-cache :app:assembleDebug --stacktrace
+      - name: Stage APK
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk" -type f -name "*.apk")
+          test "${#APKS[@]}" -eq 1
+          test -s "${APKS[0]}"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "${APKS[0]}" "$RUNNER_TEMP/release/RUNNINGBALL2-LIVE-WALLPAPER.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RUNNINGBALL2-LIVE-WALLPAPER-APK
+          path: ${{ runner.temp }}/release/RUNNINGBALL2-LIVE-WALLPAPER.apk
+          if-no-files-found: error
+          retention-days: 14
