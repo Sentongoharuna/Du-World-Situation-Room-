@@ -1,0 +1,212 @@
+name: DUWM 4.21 FIX6 Continuous Globe Rotation APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/DUWM-4-21-FIX6-CONTINUOUS-GLOBE-ROTATION.yml'
+      - 'DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duwm-421-fix6-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout frozen source repository
+        uses: actions/checkout@v4
+
+      - name: Verify and unpack exact DUWM 4.21 FIX2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'e6c0222d1d7fc12cae1f939af349aefddb86e44cfc76ffcd2e00169d5ac813d2  DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz' | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/duwm"
+          tar -xzf DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm"
+          PROJECT_DIR="$RUNNER_TEMP/duwm/DUWM-1-2-20-4-21-FIX2-PROJECT"
+          test -f "$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify original aircraft and globe source before modification
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$PROJECT_DIR/scripts/verify-4-21-air.sh" "$PROJECT_DIR"
+
+      - name: Repair ONLY native globe frame clock and initial rotation pause
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PY'
+          from pathlib import Path
+          import sys
+
+          base = Path(sys.argv[1])
+          file = base / 'app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java'
+          code = file.read_text(encoding='utf-8')
+
+          def replace_once(before, after, label):
+              global code
+              count = code.count(before)
+              if count != 1:
+                  raise SystemExit(f'Unsafe to patch {label}: expected 1 match; found {count}. Source unchanged.')
+              code = code.replace(before, after, 1)
+              print('Patched:', label)
+
+          replace_once(
+              '''    private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (isAttachedToWindow() && isShown()) postInvalidateOnAnimation();
+                  }
+              };''',
+              '''    // FIX6: independent, lifecycle-scoped animation heartbeat. Not tied to data updates.
+              private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!isAttachedToWindow() || !isShown()) return;
+                      postInvalidateOnAnimation();
+                      postDelayed(this, 40L); // 25 fps: continuous but power-aware
+                  }
+              };''',
+              'continuous heartbeat')
+
+          replace_once(
+              '''        // Adaptive pacing preserves visible movement without allowing a dense global snapshot
+                  // to starve taps, scrolling or Android's launch watchdog.
+                  removeCallbacks(framePulse);
+                  long frameDelayMs = signals.size() > 1_800 ? 50L
+                          : signals.size() > 800 ? 40L : 33L;
+                  postOnAnimationDelayed(framePulse, frameDelayMs);''',
+              '''        // FIX6: framePulse owns subsequent frames; onDraw never cancels its next tick.''',
+              'remove draw-coupled scheduling')
+
+          replace_once(
+              '''            interactionPauseUntilMs = SystemClock.uptimeMillis() + 15_000L;''',
+              '''            // Initial focus must not freeze the globe for fifteen seconds.
+                          interactionPauseUntilMs = 0L;''',
+              'eliminate 15-second startup freeze')
+
+          lifecycle = '''    // FIX6: run only while attached and visible; resume after Android backgrounding.
+              @Override
+              protected void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  removeCallbacks(framePulse);
+                  post(framePulse);
+              }
+
+              @Override
+              protected void onDetachedFromWindow() {
+                  removeCallbacks(framePulse);
+                  super.onDetachedFromWindow();
+              }
+
+              @Override
+              protected void onWindowVisibilityChanged(int visibility) {
+                  super.onWindowVisibilityChanged(visibility);
+                  removeCallbacks(framePulse);
+                  if (visibility == VISIBLE && isAttachedToWindow()) post(framePulse);
+              }
+
+          '''
+          anchor = '''    @Override
+              protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {'''
+          replace_once(anchor, lifecycle + anchor, 'globe foreground/background lifecycle')
+
+          # Protect the original geographic drawing and existing object tracking.
+          for marker in ('updateAutoRotation();', 'drawGlobe(canvas);',
+                         'drawSignals(canvas);', 'recordProviderFixes(',
+                         'drawTrackedCallout(canvas);', 'drawOperationalArcs(canvas);'):
+              if marker not in code:
+                  raise SystemExit('Required original rendering code missing: ' + marker)
+          assert 'postDelayed(this, 40L)' in code
+          assert 'interactionPauseUntilMs = 0L;' in code
+          assert 'onDetachedFromWindow()' in code
+          file.write_text(code, encoding='utf-8')
+          print('Globe source patched; aircraft, tracking, drawing methods retained.')
+          PY
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Android SDK (no obsolete tools package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT" && test -d "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Compile and build FIX6 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:assembleDebug --stacktrace
+
+      - name: Check APK content and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -eq 1
+          APK="${APKS[0]}"
+          test -s "$APK"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              assert z.testzip() is None
+              assert 'AndroidManifest.xml' in z.namelist()
+              assert 'classes.dex' in z.namelist()
+          print('APK ZIP + DEX verified')
+          PY
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$APK" "$RUNNER_TEMP/release/DUWM-4-21-FIX6-CONTINUOUS-GLOBE.apk"
+          sha256sum "$RUNNER_TEMP/release/DUWM-4-21-FIX6-CONTINUOUS-GLOBE.apk"
+
+      - name: Upload FIX6 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX6-CONTINUOUS-GLOBE-APK
+          path: ${{ runner.temp }}/release/DUWM-4-21-FIX6-CONTINUOUS-GLOBE.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Existing Android lint audit (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:lintDebug
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX6-LINT-AUDIT
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/lint-results-debug.*
+            ${{ env.PROJECT_DIR }}/app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/*.txt
+          if-no-files-found: ignore
+          retention-days: 30
