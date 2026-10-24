@@ -1,0 +1,239 @@
+name: DUWM 4.21 FIX7 Rotation Compile Repair APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/DUWM-421-FIX7-GLOBE-COMPILER-REPAIR-APK.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duwm-421-fix7-rotation-compile-repair-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact public baseline repository (not the Pages website)
+        uses: actions/checkout@v4
+        with:
+          repository: Sentongoharuna/kampala-city-live-
+          ref: main
+          path: duwm-source
+          persist-credentials: false
+
+      # The workflow runs in Du-World-Situation-Room-, but the immutable
+      # 4.21 Android source archive is in the public kampala-city-live- repository.
+      # This prevents mistakenly building the GitHub Pages website as an APK.
+      - name: Verify and unpack exact DUWM 4.21 FIX2 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'e6c0222d1d7fc12cae1f939af349aefddb86e44cfc76ffcd2e00169d5ac813d2  duwm-source/DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz' | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/duwm"
+          tar -xzf duwm-source/DUWM-1-2-20-4-21-FIX2-SOURCE.tar.gz -C "$RUNNER_TEMP/duwm"
+          PROJECT_DIR="$RUNNER_TEMP/duwm/DUWM-1-2-20-4-21-FIX2-PROJECT"
+          test -f "$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify original aircraft and globe source before modification
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$PROJECT_DIR/scripts/verify-4-21-air.sh" "$PROJECT_DIR"
+
+      - name: Repair continuous rotation without duplicate lifecycle methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PYFIX'
+          from pathlib import Path
+          import re
+          import sys
+
+          base = Path(sys.argv[1])
+          file = base / 'app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java'
+          code = file.read_text(encoding='utf-8')
+          original = code
+
+          def replace_once(before, after, label):
+              global code
+              count = code.count(before)
+              if count != 1:
+                  raise SystemExit(f'Patch blocked at {label}: expected exactly 1 match, found {count}')
+              code = code.replace(before, after, 1)
+              print('Patched:', label)
+
+          replace_once(
+              '''    private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (isAttachedToWindow() && isShown()) postInvalidateOnAnimation();
+                  }
+              };''',
+              '''    // Continuous, visibility-scoped frame heartbeat; independent of network callbacks.
+              private final Runnable framePulse = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!isAttachedToWindow() || !isShown()) return;
+                      postInvalidateOnAnimation();
+                      postDelayed(this, 40L);
+                  }
+              };''',
+              'frame heartbeat')
+
+          replace_once(
+              '''        // Adaptive pacing preserves visible movement without allowing a dense global snapshot
+                  // to starve taps, scrolling or Android's launch watchdog.
+                  removeCallbacks(framePulse);
+                  long frameDelayMs = signals.size() > 1_800 ? 50L
+                          : signals.size() > 800 ? 40L : 33L;
+                  postOnAnimationDelayed(framePulse, frameDelayMs);''',
+              '''        // Frame heartbeat posts the next tick; drawing never cancels it.''',
+              'remove competing draw-loop callback scheduling')
+
+          replace_once(
+              '''            interactionPauseUntilMs = SystemClock.uptimeMillis() + 15_000L;''',
+              '''            interactionPauseUntilMs = 0L; // Startup focus must not stop the globe.''',
+              'remove startup pause only')
+
+          # IMPORTANT: Do not add a second onWindowVisibilityChanged or onDetachedFromWindow.
+          # Modify the EXISTING visibility lifecycle, preserving original tile-store cleanup.
+          replace_once(
+              '''    @Override
+              protected void onWindowVisibilityChanged(int visibility) {
+                  super.onWindowVisibilityChanged(visibility);
+                  if (visibility == View.VISIBLE && isAttachedToWindow()) {
+                      lastFrameMs = 0L;
+                      postInvalidateOnAnimation();
+                  } else {
+                      removeCallbacks(framePulse);
+                  }
+              }''',
+              '''    @Override
+              protected void onWindowVisibilityChanged(int visibility) {
+                  super.onWindowVisibilityChanged(visibility);
+                  removeCallbacks(framePulse);
+                  if (visibility == View.VISIBLE && isAttachedToWindow()) {
+                      lastFrameMs = 0L;
+                      post(framePulse);
+                  }
+              }''',
+              'reuse existing window-visibility lifecycle')
+
+          # The original source has no onAttachedToWindow override. Add exactly one.
+          replace_once(
+              '''    @Override
+              protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {''',
+              '''    @Override
+              protected void onAttachedToWindow() {
+                  super.onAttachedToWindow();
+                  lastFrameMs = 0L;
+                  removeCallbacks(framePulse);
+                  if (isShown()) post(framePulse);
+              }
+
+              @Override
+              protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {''',
+              'start heartbeat when globe is attached')
+
+          # Fail before Gradle if any lifecycle override has been duplicated.
+          for method in ('onAttachedToWindow', 'onWindowVisibilityChanged', 'onDetachedFromWindow'):
+              count = len(re.findall(r'protected\s+void\s+' + method + r'\s*\(', code))
+              if count != 1:
+                  raise SystemExit(f'Lifecycle duplicate or missing: {method}, count={count}')
+
+          required = ('updateAutoRotation();', 'drawGlobe(canvas);',
+                      'drawSignals(canvas);', 'recordProviderFixes(',
+                      'drawTrackedCallout(canvas);', 'drawOperationalArcs(canvas);',
+                      'baseTiles.shutdown();', 'overlayTiles.shutdown();')
+          if any(x not in code or x not in original for x in required):
+              raise SystemExit('A protected aircraft, globe or tile method has changed')
+          if 'postDelayed(this, 40L)' not in code or 'interactionPauseUntilMs = 0L;' not in code:
+              raise SystemExit('Animation clock was not configured')
+          file.write_text(code, encoding='utf-8')
+          print('FIX7 verified: one copy of each lifecycle method, source intact')
+          PYFIX
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Android SDK (no obsolete tools package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT" && test -d "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Compile and build FIX7 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:assembleDebug --stacktrace
+
+      - name: Check APK content and signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -eq 1
+          APK="${APKS[0]}"
+          test -s "$APK"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              assert z.testzip() is None
+              assert 'AndroidManifest.xml' in z.namelist()
+              assert 'classes.dex' in z.namelist()
+          print('APK ZIP + DEX verified')
+          PY
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$APK" "$RUNNER_TEMP/release/DUWM-4-21-FIX7-CORRECT-REPO-CONTINUOUS-GLOBE.apk"
+          sha256sum "$RUNNER_TEMP/release/DUWM-4-21-FIX7-CORRECT-REPO-CONTINUOUS-GLOBE.apk"
+
+      - name: Upload FIX7 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX7-CORRECT-REPO-APK
+          path: ${{ runner.temp }}/release/DUWM-4-21-FIX7-CORRECT-REPO-CONTINUOUS-GLOBE.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Existing Android lint audit (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:lintDebug
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUWM-4-21-FIX7-CORRECT-REPO-LINT-AUDIT
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/lint-results-debug.*
+            ${{ env.PROJECT_DIR }}/app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/*.txt
+          if-no-files-found: ignore
+          retention-days: 30
