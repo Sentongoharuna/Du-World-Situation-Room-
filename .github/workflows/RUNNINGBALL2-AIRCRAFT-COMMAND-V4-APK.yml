@@ -1,0 +1,1651 @@
+name: RUNNINGBALL2 AIRCRAFT COMMAND V4 ANDROID APK
+run-name: "RUNNINGBALL2 AIR COMMAND V4 #${{ github.run_number }}"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/RUNNINGBALL2-AIRCRAFT-COMMAND-V4-APK.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runningball2-aircommand4-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout recipient repository (no external source imports)
+        uses: actions/checkout@v4
+
+      # Original RUNNINGBALL2 archive, verified against the original source SHA-256.
+      # Embedded in this one workflow so GitHub needs no missing .tar.gz upload.
+      - name: Recover exact original RUNNINGBALL2 source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, re
+          from pathlib import Path
+          source = Path(".github/workflows/RUNNINGBALL2-PROTECTED-BASE-SELF-CONTAINED.yml").read_text(encoding="utf-8")
+          m = re.search(r"<<'RUNNINGBALL2_SOURCE_BASE64'\n(.*?)\n\s*RUNNINGBALL2_SOURCE_BASE64", source, re.S)
+          if m is None:
+              raise SystemExit("The original RUNNINGBALL2 archive is missing")
+          archive = base64.b64decode("".join(m.group(1).split()), validate=True)
+          expected = "1be8caba512b4fa2430f636fcfc6a4a73a1a484a9d3b64e829f3d3a606e7d32a"
+          assert hashlib.sha256(archive).hexdigest() == expected, "Wrong source SHA-256"
+          Path("DUWM-1-2-20-2-20-FULL-REGRESSION-FIX2-SOURCE.tar.gz").write_bytes(archive)
+          print("Original RUNNINGBALL2 archive restored and verified")
+          PY
+
+      - name: Extract original RUNNINGBALL2 project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/runningball2"
+          tar -xzf DUWM-1-2-20-2-20-FULL-REGRESSION-FIX2-SOURCE.tar.gz -C "$RUNNER_TEMP/runningball2"
+          PROJECT_DIR="$RUNNER_TEMP/runningball2/world-situation-room-native-1-2-20-2-20"
+          test -s "$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom/SatelliteMapView.java"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Run original cumulative full source-to-globe regression gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$PROJECT_DIR/scripts/verify-1-2-20-2-20-full-regression.sh" "$PROJECT_DIR"
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Verify supported Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT" && test -d "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0'
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: RUNNINGBALL2 add live wallpaper mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          RES="$PROJECT_DIR/app/src/main/res"
+          MANIFEST="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -s "$PKG/SatelliteMapView.java"
+          test -s "$MANIFEST"
+          GLOBE_BEFORE="$(sha256sum "$PKG/SatelliteMapView.java" | awk '{print $1}')"
+          mkdir -p "$RES/xml" "$RES/values"
+
+          cat > "$PKG/DuwmLiveWallpaperService.java" <<'JAVA'
+          package com.sentongoharuna.worldsituationroom;
+          import android.service.wallpaper.WallpaperService;
+          import android.view.SurfaceHolder;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.Color;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+
+          public final class DuwmLiveWallpaperService extends WallpaperService {
+            @Override public Engine onCreateEngine(){ return new GlobeEngine(); }
+            private final class GlobeEngine extends Engine {
+              private final Handler ui=new Handler(Looper.getMainLooper());
+              private final Paint earth=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint grid=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint accent=new Paint(Paint.ANTI_ALIAS_FLAG);
+              private boolean visible=false, pending=false;
+              private long lastMs=0L;
+              private double rotation=0.0d;
+              private static final long FRAME_MS=33L;
+
+              private final Runnable tick=new Runnable(){
+                @Override public void run(){
+                  pending=false;
+                  if(!visible)return;
+                  long now=SystemClock.uptimeMillis();
+                  long dt=lastMs==0L?FRAME_MS:Math.min(100L,Math.max(0L,now-lastMs));
+                  lastMs=now;
+                  rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;
+                  drawGlobe();
+                  schedule();
+                }
+              };
+
+              GlobeEngine(){
+                earth.setColor(Color.rgb(5,18,31)); earth.setStyle(Paint.Style.FILL);
+                grid.setColor(Color.argb(95,58,185,220)); grid.setStyle(Paint.Style.STROKE); grid.setStrokeWidth(1.2f);
+                accent.setColor(Color.rgb(58,220,132)); accent.setStyle(Paint.Style.STROKE); accent.setStrokeWidth(2f);
+              }
+              private void schedule(){ if(!visible||pending)return; pending=true; ui.postDelayed(tick,FRAME_MS); }
+              private void stop(){ visible=false; pending=false; ui.removeCallbacks(tick); }
+              @Override public void onVisibilityChanged(boolean v){ visible=v; if(v){lastMs=0L;schedule();}else stop(); }
+              @Override public void onSurfaceChanged(SurfaceHolder h,int f,int w,int x){super.onSurfaceChanged(h,f,w,x);if(visible)drawGlobe();}
+              @Override public void onSurfaceDestroyed(SurfaceHolder h){stop();super.onSurfaceDestroyed(h);}
+              @Override public void onDestroy(){stop();super.onDestroy();}
+
+              private void drawGlobe(){
+                SurfaceHolder h=getSurfaceHolder(); Canvas c=null;
+                try{
+                  c=h.lockCanvas(); if(c==null)return; c.drawColor(Color.BLACK);
+                  float w=c.getWidth(), ht=c.getHeight(), cx=w*.5f, cy=ht*.48f, r=Math.min(w,ht)*.34f;
+                  c.drawCircle(cx,cy,r,earth);
+                  for(int lat=-60;lat<=60;lat+=30){
+                    float y=cy-(float)Math.sin(Math.toRadians(lat))*r;
+                    float rx=(float)(Math.cos(Math.toRadians(lat))*r);
+                    c.drawOval(cx-rx,y-r*.08f,cx+rx,y+r*.08f,grid);
+                  }
+                  for(int lon=0;lon<180;lon+=30){
+                    double a=Math.toRadians(lon+rotation); float rx=(float)(Math.abs(Math.cos(a))*r);
+                    c.drawOval(cx-rx,cy-r,cx+rx,cy+r,grid);
+                  }
+                  double a=Math.toRadians(rotation);
+                  c.drawCircle(cx+(float)Math.cos(a)*r,cy+(float)Math.sin(a)*r*.25f,7f,accent);
+                } finally { if(c!=null)h.unlockCanvasAndPost(c); }
+              }
+            }
+          }
+          JAVA
+
+          cat > "$PKG/LiveWallpaperLauncherActivity.java" <<'JAVA'
+          package com.sentongoharuna.worldsituationroom;
+          import android.app.Activity;
+          import android.app.WallpaperManager;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.os.Bundle;
+          public final class LiveWallpaperLauncherActivity extends Activity {
+            @Override protected void onCreate(Bundle b){
+              super.onCreate(b);
+              Intent i=new Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER);
+              i.putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,new ComponentName(this,DuwmLiveWallpaperService.class));
+              try{startActivity(i);}catch(Throwable t){startActivity(new Intent(WallpaperManager.ACTION_LIVE_WALLPAPER_CHOOSER));}
+              finish();
+            }
+          }
+          JAVA
+
+          cat > "$RES/xml/duwm_live_wallpaper.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <wallpaper xmlns:android="http://schemas.android.com/apk/res/android"
+            android:description="@string/duwm_live_wallpaper_description" />
+          XML
+
+          cat > "$RES/values/duwm_live_wallpaper_strings.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <string name="duwm_live_wallpaper_name">DU World Monitor Live Globe</string>
+            <string name="duwm_live_wallpaper_description">Live rotating DU World Monitor globe wallpaper.</string>
+          </resources>
+          XML
+
+          python3 - "$MANIFEST" <<'PY'
+          import pathlib,sys
+          p=pathlib.Path(sys.argv[1]); s=p.read_text()
+          if 'DuwmLiveWallpaperService' not in s:
+              at=s.rfind('</application>')
+              if at<0: raise SystemExit("application close tag missing")
+              block='''\
+              <service android:name=".DuwmLiveWallpaperService" android:exported="true"
+                android:label="@string/duwm_live_wallpaper_name"
+                android:permission="android.permission.BIND_WALLPAPER">
+                <intent-filter><action android:name="android.service.wallpaper.WallpaperService" /></intent-filter>
+                <meta-data android:name="android.service.wallpaper" android:resource="@xml/duwm_live_wallpaper" />
+              </service>
+              <activity android:name=".LiveWallpaperLauncherActivity" android:exported="false" />
+              '''
+              p.write_text(s[:at]+block+s[at:])
+          PY
+
+          GLOBE_AFTER="$(sha256sum "$PKG/SatelliteMapView.java" | awk '{print $1}')"
+          test "$GLOBE_BEFORE" = "$GLOBE_AFTER"
+          echo "RUNNINGBALL2 WORKING GLOBE SOURCE PRESERVED"
+
+      # Separate fetch/overlay layer. The 33ms WallpaperService loop is protected.
+      # Tracks are drawn in an independent, north-up 250 NM radar inset.
+      - name: Add live aircraft intelligence (isolated optional overlay)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          cat > "$PKG/DuwmAircraftIntelligence.java" <<'JAVA_AIR1'
+          package com.sentongoharuna.worldsituationroom;
+          
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.os.Handler;
+          import android.os.Looper;
+          
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          
+          /**
+           * Optional aircraft-only overlay for the protected RUNNINGBALL2 WallpaperService.
+           * Never performs networking or parsing in the original 33ms SurfaceHolder draw loop.
+           * Data coverage is a 250 NM radial query around Kampala, NOT world-wide air traffic.
+           */
+          final class DuwmAircraftIntelligence {
+              private static final double KAMPALA_LAT = 0.3476;
+              private static final double KAMPALA_LON = 32.5825;
+              private static final double RADIUS_NM = 250d;
+              private static final String SOURCE = "https://api.adsb.lol/v2/point/0.3476/32.5825/250";
+              private static final long POLL_MS = 60_000L;
+              private static final long STALE_MS = 180_000L;
+              private static final long MAX_CACHED_MS = 300_000L;
+              private static final long TRAIL_RETENTION_MS = 900_000L;
+          
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final ExecutorService io = Executors.newSingleThreadExecutor();
+              private final Map<String, ArrayDeque<Fix>> history = new HashMap<>();
+              private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final float dp;
+              private final float sp;
+              private volatile Snapshot snapshot = Snapshot.startup();
+              private boolean visible;
+              private boolean closed;
+          
+              private final Runnable poll = new Runnable() {
+                  @Override public void run() {
+                      if (!visible || closed) return;
+                      io.execute(new Runnable() {
+                          @Override public void run() { refresh(); }
+                      });
+                      ui.postDelayed(this, POLL_MS);
+                  }
+              };
+          
+              DuwmAircraftIntelligence(Context context) {
+                  dp = context.getResources().getDisplayMetrics().density;
+                  sp = context.getResources().getDisplayMetrics().scaledDensity;
+                  text.setTypeface(android.graphics.Typeface.MONOSPACE);
+              }
+          
+              void setVisible(boolean value) {
+                  ui.removeCallbacks(poll);
+                  visible = value && !closed;
+                  if (visible) ui.post(poll);
+              }
+          
+              void close() {
+                  closed = true;
+                  visible = false;
+                  ui.removeCallbacks(poll);
+                  io.shutdownNow();
+              }
+          
+              private void refresh() {
+                  HttpURLConnection conn = null;
+                  try {
+                      conn = (HttpURLConnection) new URL(SOURCE).openConnection();
+                      conn.setRequestMethod("GET");
+                      conn.setRequestProperty("Accept", "application/json");
+                      conn.setRequestProperty("User-Agent", "DUWM-RUNNINGBALL2-Aircraft/1.0");
+                      conn.setConnectTimeout(8_000);
+                      conn.setReadTimeout(8_000);
+                      final int response = conn.getResponseCode();
+                      if (response != 200) {
+                          throw new IllegalStateException(response == 429 ? "RATE LIMITED" : "HTTP " + response);
+                      }
+                      final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                      try (InputStream in = conn.getInputStream()) {
+                          byte[] buffer = new byte[8192];
+                          int n;
+                          while ((n = in.read(buffer)) != -1) {
+                              if (bytes.size() + n > 2_000_000) throw new IllegalStateException("OVERSIZED FEED");
+                              bytes.write(buffer, 0, n);
+                          }
+                      }
+                      JSONObject root = new JSONObject(new String(bytes.toByteArray(), StandardCharsets.UTF_8));
+                      JSONArray data = root.optJSONArray("ac");
+                      if (data == null) throw new IllegalStateException("NO AIRCRAFT ARRAY");
+                      final long now = System.currentTimeMillis();
+                      List<Aircraft> aircraft = new ArrayList<>();
+                      for (int i = 0; i < data.length() && i < 1_000; i++) {
+                          JSONObject row = data.optJSONObject(i);
+                          if (row == null) continue;
+                          String id = row.optString("hex", "").trim();
+                          if (!id.matches("(?i)[0-9a-f]{6}")) continue;
+                          double lat = row.optDouble("lat", Double.NaN);
+                          double lon = row.optDouble("lon", Double.NaN);
+                          double seen = row.optDouble("seen_pos", Double.NaN);
+                          if (!valid(lat) || !valid(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180
+                                  || !valid(seen) || seen < 0 || seen > 120) continue;
+                          double distance = distanceNm(KAMPALA_LAT, KAMPALA_LON, lat, lon);
+                          if (distance > RADIUS_NM) continue;
+                          String callsign = row.optString("flight", "").trim();
+                          if (callsign.isEmpty()) callsign = id.toUpperCase(Locale.US);
+                          double altitude = row.optDouble("alt_baro", Double.NaN);
+                          double speed = row.optDouble("gs", Double.NaN); // ADS-B ground speed in knots
+                          double heading = row.optDouble("track", Double.NaN);
+                          Fix current = new Fix(lat, lon, now - (long) (seen * 1000d));
+                          ArrayDeque<Fix> track = history.get(id);
+                          if (track == null) { track = new ArrayDeque<>(); history.put(id, track); }
+                          Fix previous = track.peekLast();
+                          if (previous == null || (previous.timeMs < current.timeMs
+                                  && distanceNm(previous.lat, previous.lon, current.lat, current.lon) >= 0.05d)) {
+                              track.addLast(current);
+                          }
+                          while (track.size() > 6) track.removeFirst();
+                          while (!track.isEmpty() && now - track.peekFirst().timeMs > TRAIL_RETENTION_MS) {
+                              track.removeFirst();
+                          }
+                          aircraft.add(new Aircraft(id, callsign, lat, lon, altitude, speed, heading,
+                                  seen, distance, current, Collections.unmodifiableList(new ArrayList<>(track))));
+                      }
+                      Iterator<Map.Entry<String, ArrayDeque<Fix>>> iter = history.entrySet().iterator();
+                      while (iter.hasNext()) {
+                          ArrayDeque<Fix> tracks = iter.next().getValue();
+                          if (tracks.isEmpty() || now - tracks.peekLast().timeMs > TRAIL_RETENTION_MS) iter.remove();
+                      }
+                      Collections.sort(aircraft, new Comparator<Aircraft>() {
+                          @Override public int compare(Aircraft a, Aircraft b) {
+                              return Double.compare(a.distanceNm, b.distanceNm);
+                          }
+                      });
+                      if (aircraft.size() > 50) aircraft = new ArrayList<>(aircraft.subList(0, 50));
+                      snapshot = new Snapshot(Collections.unmodifiableList(aircraft), now, "LIVE");
+                  } catch (Exception e) {
+                      Snapshot old = snapshot;
+                      String reason = e.getMessage() == null ? "UNAVAILABLE" : e.getMessage();
+                      // Last known observations are retained but will never be labeled LIVE.
+                      snapshot = new Snapshot(old.aircraft, old.retrievedAtMs,
+                              "RATE LIMITED".equals(reason) ? "RATE LIMITED" : "UNAVAILABLE");
+                  } finally {
+                      if (conn != null) conn.disconnect();
+                  }
+              }
+          
+              private static boolean valid(double v) { return !Double.isNaN(v) && !Double.isInfinite(v); }
+              private static double distanceNm(double la1, double lo1, double la2, double lo2) {
+                  double dLat = Math.toRadians(la2 - la1);
+                  double dLon = Math.toRadians(lo2 - lo1);
+                  double a = Math.pow(Math.sin(dLat / 2d), 2)
+                          + Math.cos(Math.toRadians(la1)) * Math.cos(Math.toRadians(la2))
+                          * Math.pow(Math.sin(dLon / 2d), 2);
+                  return 3440.065d * 2d * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0d, 1d - a)));
+              }
+          
+              /** The radar is north-up, separate from the decorative rotating wallpaper globe. */
+              void draw(Canvas c) {
+                  if (c.getWidth() <= 0 || c.getHeight() <= 0) return;
+                  Snapshot snap = snapshot;
+                  long age = snap.retrievedAtMs == 0 ? Long.MAX_VALUE :
+                          Math.max(0, System.currentTimeMillis() - snap.retrievedAtMs);
+                  boolean live = "LIVE".equals(snap.status) && age <= STALE_MS;
+                  boolean cached = !live && age <= MAX_CACHED_MS;
+                  List<Aircraft> show = (live || cached) ? snap.aircraft : Collections.<Aircraft>emptyList();
+                  String state = live ? "LIVE" : cached ? "CACHED" : snap.status;
+          
+                  float w = c.getWidth();
+                  float left = 12f * dp;
+                  float right = Math.min(w - left, left + 355f * dp);
+                  float top = 12f * dp;
+                  float bottom = top + 182f * dp;
+                  paint.setStyle(Paint.Style.FILL);
+                  paint.setColor(Color.argb(214, 3, 15, 24));
+                  c.drawRoundRect(left, top, right, bottom, 12f * dp, 12f * dp, paint);
+                  paint.setColor(Color.argb(240, 62, 195, 226));
+                  c.drawRoundRect(left, top, left + 3f * dp, bottom, 2f * dp, 2f * dp, paint);
+                  float x = left + 13f * dp;
+                  label(c, "AIRCRAFT INTELLIGENCE", x, top + 19f * dp, 12f, Color.rgb(178, 225, 242));
+                  label(c, "KAMPALA  |  250 NM", x, top + 36f * dp, 9f, Color.rgb(152, 175, 193));
+                  label(c, state + "  /  " + (live ? show.size() + " DISPLAYED" : "NOT LIVE"),
+                          x, top + 54f * dp, 9f,
+                          live ? Color.rgb(89, 220, 144) : Color.rgb(240, 184, 105));
+          
+                  float rx = right - 67f * dp;
+                  float ry = top + 100f * dp;
+                  float radius = 48f * dp;
+                  paint.setStyle(Paint.Style.STROKE);
+                  paint.setStrokeWidth(dp);
+                  paint.setColor(Color.argb(145, 88, 179, 205));
+                  c.drawCircle(rx, ry, radius, paint);
+                  c.drawCircle(rx, ry, radius / 2f, paint);
+                  c.drawLine(rx - radius, ry, rx + radius, ry, paint);
+                  c.drawLine(rx, ry - radius, rx, ry + radius, paint);
+                  paint.setStyle(Paint.Style.FILL);
+                  paint.setColor(Color.rgb(88, 222, 167));
+                  c.drawCircle(rx, ry, 2.5f * dp, paint); // Kampala centre
+          
+                  int visibleDots = 0;
+                  for (Aircraft a : show) {
+                      if (visibleDots++ >= 65) break;
+                      for (int j = 1; j < a.trail.size(); j++) {
+                          Fix p = a.trail.get(j - 1);
+                          Fix q = a.trail.get(j);
+                          float fromX = rx + p.nx * radius, fromY = ry - p.ny * radius;
+                          float toX = rx + q.nx * radius, toY = ry - q.ny * radius;
+                          paint.setStyle(Paint.Style.STROKE);
+                          paint.setStrokeWidth(1.2f * dp);
+                          paint.setColor(Color.argb(145, 73, 202, 234));
+                          c.drawLine(fromX, fromY, toX, toY, paint);
+                      }
+                      float pointX = rx + a.position.nx * radius;
+                      float pointY = ry - a.position.ny * radius;
+                      paint.setStyle(Paint.Style.FILL);
+                      paint.setColor(live ? Color.rgb(117, 235, 196) : Color.rgb(188, 161, 108));
+                      c.drawCircle(pointX, pointY, 2.2f * dp, paint);
+                      if (valid(a.headingDeg)) {
+                          double hdg = Math.toRadians(a.headingDeg);
+                          c.drawLine(pointX, pointY, pointX + (float) Math.sin(hdg) * 5f * dp,
+                                  pointY - (float) Math.cos(hdg) * 5f * dp, paint);
+                      }
+                  }
+                  int maxRows = Math.min(3, show.size());
+                  for (int i = 0; i < maxRows; i++) {
+                      Aircraft a = show.get(i);
+                      String line1 = truncate(a.callsign, 10) + String.format(Locale.US,
+                              "  %.0fS AGO", a.seenSeconds + Math.max(0, age) / 1000d);
+                      label(c, line1, x, top + (83 + i * 29) * dp, 8.2f, Color.rgb(217, 237, 241));
+                      label(c, String.format(Locale.US, "%s  %s  HDG %s",
+                                      altitudeText(a.altitudeFt), speedText(a.speedKt), headingText(a.headingDeg)),
+                              x, top + (96 + i * 29) * dp, 7f, Color.rgb(145, 178, 197));
+                  }
+                  if (maxRows == 0) {
+                      label(c, live ? "NO REPORTS IN RANGE" : "WAITING FOR FEED", x,
+                              top + 96f * dp, 8f, Color.rgb(180, 196, 205));
+                  }
+                  label(c, "SOURCE: ADSB.LOL  /  POSITIONS SUBJECT TO COVERAGE",
+                          x, bottom - 8f * dp, 6.6f, Color.rgb(136, 155, 167));
+              }
+          
+              private void label(Canvas canvas, String value, float x, float y, float size, int color) {
+                  text.setTextSize(size * sp);
+                  text.setColor(color);
+                  canvas.drawText(value, x, y, text);
+              }
+              private static String truncate(String x, int n) { return x.length() <= n ? x : x.substring(0, n); }
+              private static String altitudeText(double ft) {
+                  return valid(ft) ? String.format(Locale.US, "%.0fFT", ft) : "ALT --";
+              }
+              private static String speedText(double kt) {
+                  return valid(kt) ? String.format(Locale.US, "%.0fKT", kt) : "GS --";
+              }
+              private static String headingText(double deg) {
+                  return valid(deg) ? String.format(Locale.US, "%03.0f", (deg + 360d) % 360d) : "---";
+              }
+          
+              private static final class Fix {
+                  final double lat, lon;
+                  final float nx, ny; // Precomputed normalized radar position, zero allocations in draw loop
+                  final long timeMs;
+                  Fix(double lat, double lon, long timeMs) {
+                      this.lat = lat; this.lon = lon; this.timeMs = timeMs;
+                      double east = (lon - KAMPALA_LON) * 60d * Math.cos(Math.toRadians(KAMPALA_LAT)) / RADIUS_NM;
+                      double north = (lat - KAMPALA_LAT) * 60d / RADIUS_NM;
+                      double mag = Math.sqrt(east * east + north * north);
+                      if (mag > 1d) { east /= mag; north /= mag; }
+                      this.nx = (float) east;
+                      this.ny = (float) north;
+                  }
+              }
+              private static final class Aircraft {
+                  final String id, callsign;
+                  final double lat, lon, altitudeFt, speedKt, headingDeg, seenSeconds, distanceNm;
+                  final Fix position;
+                  final List<Fix> trail;
+                  Aircraft(String id, String callsign, double lat, double lon, double altitudeFt,
+                           double speedKt, double headingDeg, double seenSeconds, double distanceNm,
+                           Fix position, List<Fix> trail) {
+                      this.id = id; this.callsign = callsign; this.lat = lat; this.lon = lon;
+                      this.altitudeFt = altitudeFt; this.speedKt = speedKt;
+                      this.headingDeg = headingDeg; this.seenSeconds = seenSeconds;
+                      this.distanceNm = distanceNm; this.position = position; this.trail = trail;
+                  }
+              }
+              private static final class Snapshot {
+                  final List<Aircraft> aircraft;
+                  final long retrievedAtMs;
+                  final String status;
+                  Snapshot(List<Aircraft> aircraft, long retrievedAtMs, String status) {
+                      this.aircraft = aircraft; this.retrievedAtMs = retrievedAtMs; this.status = status;
+                  }
+                  static Snapshot startup() {
+                      return new Snapshot(Collections.<Aircraft>emptyList(), 0L, "WAITING");
+                  }
+              }
+          }
+          JAVA_AIR1
+
+          python3 - "$PKG/DuwmLiveWallpaperService.java" <<'PY_AIR1'
+          from pathlib import Path
+          import sys
+          p=Path(sys.argv[1]); original=p.read_text(encoding='utf-8')
+          updated=original
+          changes=[
+              ('    private final Paint accent=new Paint(Paint.ANTI_ALIAS_FLAG);',
+               '    private final Paint accent=new Paint(Paint.ANTI_ALIAS_FLAG);\n'
+               '    private final DuwmAircraftIntelligence air=\n'
+               '                  new DuwmAircraftIntelligence(DuwmLiveWallpaperService.this);'),
+              ('    @Override public void onVisibilityChanged(boolean v){ visible=v; if(v){lastMs=0L;schedule();}else stop(); }',
+               '    @Override public void onVisibilityChanged(boolean v){ visible=v; air.setVisible(v); if(v){lastMs=0L;schedule();}else stop(); }'),
+              ('    @Override public void onDestroy(){stop();super.onDestroy();}',
+               '    @Override public void onDestroy(){stop();air.close();super.onDestroy();}'),
+              ('        c.drawCircle(cx+(float)Math.cos(a)*r,cy+(float)Math.sin(a)*r*.25f,7f,accent);',
+               '        c.drawCircle(cx+(float)Math.cos(a)*r,cy+(float)Math.sin(a)*r*.25f,7f,accent);\n'
+               '        air.draw(c);')
+          ]
+          for old,new in changes:
+              if updated.count(old)!=1:
+                  raise SystemExit('Protected RUNNINGBALL2 patch anchor missing: '+old[:65])
+              updated=updated.replace(old,new,1)
+          compare=updated
+          for old,new in reversed(changes):
+              compare=compare.replace(new,old,1)
+          if compare!=original: raise SystemExit('Original working engine unexpectedly changed')
+          for invariant in ('FRAME_MS=33L','rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;',
+                            'ui.removeCallbacks(tick)', 'h.lockCanvas()', 'h.unlockCanvasAndPost(c)',
+                            'if(!visible||pending)return'):
+              if invariant not in updated: raise SystemExit('Protected motion invariant missing: '+invariant)
+          p.write_text(updated,encoding='utf-8')
+          print('AIR1 patch: 4 isolated overlay calls; original 33ms motion engine unchanged')
+          PY_AIR1
+
+          test -s "$PKG/DuwmAircraftIntelligence.java"
+          grep -Fq 'air.draw(c);' "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq 'RADIUS_NM = 250d;' "$PKG/DuwmAircraftIntelligence.java"
+          grep -Fq 'POLL_MS = 60_000L;' "$PKG/DuwmAircraftIntelligence.java"
+          grep -Fq 'conn.setConnectTimeout(8_000);' "$PKG/DuwmAircraftIntelligence.java"
+          echo 'AIRCRAFT INTELLIGENCE: real records only, 250 NM, no network on rendering thread'
+
+      # Independent, responsive home-screen widgets and a flight-details screen.
+      # The original wallpaper's 33ms SurfaceHolder engine and AIR1 aircraft radar are untouched.
+      - name: Add Aircraft Pulse and Aircraft Command widgets and detailed flight screen
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          RES="$PROJECT_DIR/app/src/main/res"
+          MANIFEST="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          mkdir -p "$(dirname "$PKG/AirOperationsWidgets.java")"
+          cat > "$PKG/AirOperationsWidgets.java" <<'RB_WIDGET_00'
+          package com.sentongoharuna.worldsituationroom;
+          
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.widget.RemoteViews;
+          
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.TimeZone;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          
+          /** Two opt-in, native RemoteViews home widgets. No changes to WallpaperService. */
+          public abstract class AirOperationsWidgets extends AppWidgetProvider {
+              private static final String ACTION_REFRESH = "com.sentongoharuna.worldsituationroom.AIR_WIDGET_REFRESH";
+              private static final String PREFS = "air_widget_v2";
+              private static final String DATA = "last_snapshot";
+              private static final String FAILURE = "last_error";
+              private static final String FEED = "https://api.adsb.lol/v2/point/0.3476/32.5825/250";
+              private static final long RECENT_MS = 180_000L;
+              private static final long MIN_RETRY_MS = 45_000L;
+              private static final int TEXT = Color.rgb(225, 244, 251);
+              private static final int MUTED = Color.rgb(126, 161, 183);
+              private static final int AQUA = Color.rgb(65, 216, 234);
+              private static final int GREEN = Color.rgb(76, 223, 172);
+              private static final int AMBER = Color.rgb(250, 192, 91);
+              private static final AtomicBoolean FETCHING = new AtomicBoolean(false);
+              private static final ExecutorService IO = Executors.newSingleThreadExecutor();
+              private static volatile long lastAttemptMs;
+          
+              public static final class Pulse extends AirOperationsWidgets {}
+              public static final class Command extends AirOperationsWidgets {}
+          
+              @Override public void onReceive(Context context, Intent intent) {
+                  String action = intent == null ? "" : intent.getAction();
+                  if (AppWidgetManager.ACTION_APPWIDGET_UPDATE.equals(action) || ACTION_REFRESH.equals(action)) {
+                      final Context app = context.getApplicationContext();
+                      renderAll(app); // Show cached data immediately; never block Android's main thread.
+                      long now = android.os.SystemClock.elapsedRealtime();
+                      if ((lastAttemptMs != 0L && now - lastAttemptMs < MIN_RETRY_MS)
+                              || !FETCHING.compareAndSet(false, true)) return;
+                      lastAttemptMs = now;
+                      final PendingResult completion = goAsync();
+                      try {
+                          IO.execute(new Runnable() {
+                              @Override public void run() {
+                                  try { refresh(app); }
+                                  finally {
+                                      FETCHING.set(false);
+                                      renderAll(app);
+                                      completion.finish();
+                                  }
+                              }
+                          });
+                      } catch (RuntimeException error) {
+                          FETCHING.set(false);
+                          completion.finish();
+                      }
+                      return;
+                  }
+                  super.onReceive(context, intent);
+              }
+          
+              @Override public void onUpdate(Context context, AppWidgetManager manager, int[] ids) {
+                  renderAll(context.getApplicationContext());
+              }
+          
+              @Override public void onAppWidgetOptionsChanged(Context context, AppWidgetManager manager,
+                                                                int id, android.os.Bundle options) {
+                  renderAll(context.getApplicationContext());
+              }
+          
+              private static void refresh(Context context) {
+                  HttpURLConnection conn = null;
+                  SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  try {
+                      conn = (HttpURLConnection) new URL(FEED).openConnection();
+                      conn.setConnectTimeout(3500);
+                      conn.setReadTimeout(3500);
+                      conn.setRequestProperty("Accept", "application/json");
+                      conn.setRequestProperty("User-Agent", "RUNNINGBALL2-Air-Widget/2");
+                      int status = conn.getResponseCode();
+                      if (status != 200) throw new IllegalStateException(status == 429 ? "RATE LIMITED" : "HTTP " + status);
+                      ByteArrayOutputStream data = new ByteArrayOutputStream();
+                      try (InputStream in = conn.getInputStream()) {
+                          byte[] buffer = new byte[8192];
+                          int count;
+                          while ((count = in.read(buffer)) != -1) {
+                              if (data.size() + count > 2_000_000) throw new IllegalStateException("FEED TOO LARGE");
+                              data.write(buffer, 0, count);
+                          }
+                      }
+                      JSONObject response = new JSONObject(new String(data.toByteArray(), StandardCharsets.UTF_8));
+                      JSONArray records = response.optJSONArray("ac");
+                      if (records == null) throw new IllegalStateException("NO AIRCRAFT ARRAY");
+                      List<Flight> seen = new ArrayList<>();
+                      int moving = 0, onGround = 0;
+                      for (int i=0; i<records.length() && i<1200; i++) {
+                          JSONObject row = records.optJSONObject(i);
+                          if (row == null) continue;
+                          String hex = row.optString("hex", "").trim().toUpperCase(Locale.US);
+                          if (!hex.matches("[0-9A-F]{6}")) continue;
+                          double lat = row.optDouble("lat", Double.NaN);
+                          double lon = row.optDouble("lon", Double.NaN);
+                          double positionAge = row.optDouble("seen_pos", Double.NaN);
+                          if (!finite(lat) || !finite(lon) || Math.abs(lat)>90 || Math.abs(lon)>180
+                                  || !finite(positionAge) || positionAge<0 || positionAge>120) continue;
+                          double nm = distanceNm(0.3476d, 32.5825d, lat, lon);
+                          if (nm>250d) continue;
+                          String flight = row.optString("flight", "").trim();
+                          if (flight.length()==0) flight = hex;
+                          Object altitudeRaw = row.opt("alt_baro");
+                          double altitude = altitudeRaw instanceof Number ? ((Number)altitudeRaw).doubleValue() : Double.NaN;
+                          boolean grounded = "ground".equalsIgnoreCase(String.valueOf(altitudeRaw));
+                          double speed = row.optDouble("gs", Double.NaN);
+                          double heading = row.optDouble("track", Double.NaN);
+                          if (grounded) onGround++;
+                          else if (finite(speed) && speed >= 40d) moving++;
+                          seen.add(new Flight(hex, flight, lat, lon, nm, altitude, speed, heading, positionAge, grounded));
+                      }
+                      Collections.sort(seen, new Comparator<Flight>() {
+                          @Override public int compare(Flight a, Flight b) { return Double.compare(a.distanceNm, b.distanceNm); }
+                      });
+                      JSONArray items = new JSONArray();
+                      for (int i=0; i<Math.min(seen.size(), 8); i++) items.put(seen.get(i).toJson());
+                      long now = System.currentTimeMillis();
+                      JSONObject cache = new JSONObject();
+                      cache.put("time", now);
+                      cache.put("count", seen.size());
+                      cache.put("moving", moving);
+                      cache.put("ground", onGround);
+                      cache.put("items", items);
+                      prefs.edit().putString(DATA, cache.toString()).remove(FAILURE).apply();
+                  } catch (Exception error) {
+                      String why = error.getMessage();
+                      String reason = why != null && why.contains("RATE LIMITED") ? "RATE LIMITED" : "SOURCE UNAVAILABLE";
+                      prefs.edit().putString(FAILURE, reason).apply();
+                  } finally { if (conn != null) conn.disconnect(); }
+              }
+          
+              static JSONObject lastData(Context context) {
+                  try { return new JSONObject(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(DATA, "{}")); }
+                  catch (Exception error) { return new JSONObject(); }
+              }
+          
+              private static void renderAll(Context context) {
+                  AppWidgetManager manager = AppWidgetManager.getInstance(context);
+                  JSONObject data = lastData(context);
+                  String error = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(FAILURE, "");
+                  long stamp = data.optLong("time", 0L);
+                  int count = data.optInt("count", 0);
+                  int moving = data.optInt("moving", 0);
+                  int ground = data.optInt("ground", 0);
+                  JSONArray aircraft = data.optJSONArray("items");
+                  long age = stamp==0 ? Long.MAX_VALUE : Math.max(0L, System.currentTimeMillis() - stamp);
+                  String state = stamp==0 ? "WAITING" : !error.isEmpty() ? "CACHED" : age<=RECENT_MS ? "RECENT" : "CACHED";
+                  String when = stamp==0 ? "NO REPORT YET" : "FIX " + utc(stamp);
+                  int statusColor = "RECENT".equals(state) ? GREEN : "WAITING".equals(state) ? AQUA : AMBER;
+          
+                  int[] pulse = manager.getAppWidgetIds(new ComponentName(context, Pulse.class));
+                  for (int id : pulse) {
+                      RemoteViews rv = new RemoteViews(context.getPackageName(), R.layout.rb_air_pulse);
+                      rv.setTextViewText(R.id.rb_air_pulse_count, stamp==0 ? "--" : String.valueOf(count));
+                      rv.setTextViewText(R.id.rb_air_pulse_state, state);
+                      rv.setTextColor(R.id.rb_air_pulse_state, statusColor);
+                      rv.setTextViewText(R.id.rb_air_pulse_moving, stamp==0 ? "-- MOVING" : moving + " MOVING");
+                      rv.setTextViewText(R.id.rb_air_pulse_fix, when);
+                      rv.setOnClickPendingIntent(R.id.rb_air_pulse_refresh, refreshIntent(context, id, Pulse.class));
+                      rv.setOnClickPendingIntent(R.id.rb_air_pulse_open, openDetail(context, id, ""));
+                      manager.updateAppWidget(id, rv);
+                  }
+                  int[] desk = manager.getAppWidgetIds(new ComponentName(context, Command.class));
+                  for (int id : desk) {
+                      RemoteViews rv = new RemoteViews(context.getPackageName(), R.layout.rb_air_command);
+                      rv.setTextViewText(R.id.rb_air_command_state, state);
+                      rv.setTextColor(R.id.rb_air_command_state, statusColor);
+                      rv.setTextViewText(R.id.rb_air_command_count, stamp==0 ? "--" : String.valueOf(count));
+                      rv.setTextViewText(R.id.rb_air_command_moving, stamp==0 ? "--" : String.valueOf(moving));
+                      rv.setTextViewText(R.id.rb_air_command_ground, stamp==0 ? "--" : String.valueOf(ground));
+                      rv.setTextViewText(R.id.rb_air_command_fix, when + "  •  250 NM");
+                      rv.setTextViewText(R.id.rb_air_command_provider,
+                              error.isEmpty() ? "SOURCE  ADSB.LOL  •  REPORTS ONLY" : "SOURCE  " + error + "  •  LAST KNOWN");
+                      rv.setOnClickPendingIntent(R.id.rb_air_command_refresh, refreshIntent(context, id, Command.class));
+                      int[] flightRows = {R.id.rb_air_row1, R.id.rb_air_row2, R.id.rb_air_row3};
+                      int[] names = {R.id.rb_air_call1, R.id.rb_air_call2, R.id.rb_air_call3};
+                      int[] stats = {R.id.rb_air_stat1, R.id.rb_air_stat2, R.id.rb_air_stat3};
+                      for (int index=0;index<3;index++) {
+                          JSONObject flight = aircraft == null ? null : aircraft.optJSONObject(index);
+                          String hex = "";
+                          if (flight == null) {
+                              rv.setTextViewText(names[index], index==0 && stamp>0 && count==0 ? "NO REPORTED AIRCRAFT" : "AWAITING AIRCRAFT");
+                              rv.setTextViewText(stats[index], "—");
+                          } else {
+                              hex = flight.optString("hex", "");
+                              rv.setTextViewText(names[index], trim(flight.optString("flight", hex), 14));
+                              rv.setTextViewText(stats[index], fmt(flight.optDouble("nm", Double.NaN), "NM")
+                                      + "  " + (flight.optBoolean("ground", false) ? "GROUND" : fmt(flight.optDouble("alt", Double.NaN), "FT"))
+                                      + "  " + fmt(flight.optDouble("speed", Double.NaN), "KT"));
+                          }
+                          rv.setOnClickPendingIntent(flightRows[index], openDetail(context, id * 10 + index, hex));
+                      }
+                      manager.updateAppWidget(id, rv);
+                  }
+              }
+          
+              private static PendingIntent refreshIntent(Context context, int id, Class<?> receiver) {
+                  Intent intent = new Intent(context, receiver);
+                  intent.setAction(ACTION_REFRESH);
+                  return PendingIntent.getBroadcast(context, id + (receiver==Pulse.class?100_000:200_000), intent,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+              }
+          
+              private static PendingIntent openDetail(Context context, int requestId, String hex) {
+                  Intent intent = new Intent(context, AirFlightDetailsActivity.class);
+                  intent.putExtra("air_hex", hex);
+                  return PendingIntent.getActivity(context, 300_000 + requestId, intent,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+              }
+          
+              private static String utc(long time) {
+                  SimpleDateFormat format = new SimpleDateFormat("HH:mm 'UTC'", Locale.US);
+                  format.setTimeZone(TimeZone.getTimeZone("UTC"));
+                  return format.format(new Date(time));
+              }
+              private static String trim(String value,int limit) {
+                  return value.length()<=limit?value:value.substring(0,limit);
+              }
+              static boolean finite(double value) { return !Double.isNaN(value) && !Double.isInfinite(value); }
+              static String fmt(double value, String unit) {
+                  return finite(value) ? String.format(Locale.US, "%.0f%s", value, unit) : "—";
+              }
+              private static double distanceNm(double la1,double lo1,double la2,double lo2) {
+                  double dlat=Math.toRadians(la2-la1),dlon=Math.toRadians(lo2-lo1);
+                  double h=Math.pow(Math.sin(dlat/2),2)+Math.cos(Math.toRadians(la1))
+                          *Math.cos(Math.toRadians(la2))*Math.pow(Math.sin(dlon/2),2);
+                  return 3440.065d*2d*Math.atan2(Math.sqrt(h),Math.sqrt(Math.max(0d,1d-h)));
+              }
+          
+              private static final class Flight {
+                  final String hex,flight;
+                  final double lat,lon,distanceNm,altitudeFt,speedKt,headingDeg,seenSeconds;
+                  final boolean ground;
+                  Flight(String hex,String flight,double lat,double lon,double nm,double alt,double spd,double hdg,double seen,boolean ground) {
+                      this.hex=hex;this.flight=flight;this.lat=lat;this.lon=lon;this.distanceNm=nm;
+                      this.altitudeFt=alt;this.speedKt=spd;this.headingDeg=hdg;this.seenSeconds=seen;this.ground=ground;
+                  }
+                  JSONObject toJson() throws org.json.JSONException {
+                      JSONObject o=new JSONObject();
+                      o.put("hex",hex);o.put("flight",flight);o.put("lat",lat);o.put("lon",lon);
+                      o.put("nm",distanceNm);o.put("ground",ground);o.put("seen",seenSeconds);
+                      if(finite(altitudeFt))o.put("alt",altitudeFt);
+                      if(finite(speedKt))o.put("speed",speedKt);
+                      if(finite(headingDeg))o.put("heading",headingDeg);
+                      return o;
+                  }
+              }
+          }
+          RB_WIDGET_00
+
+          mkdir -p "$(dirname "$PKG/AirFlightDetailsActivity.java")"
+          cat > "$PKG/AirFlightDetailsActivity.java" <<'RB_WIDGET_01'
+          package com.sentongoharuna.worldsituationroom;
+          
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+          import java.util.TimeZone;
+          
+          /** Accessible, scrollable report, opened from any aircraft widget row. */
+          public final class AirFlightDetailsActivity extends Activity {
+              private final int background = Color.rgb(7, 15, 26);
+              private final int ink = Color.rgb(228, 240, 248);
+              private final int muted = Color.rgb(139, 168, 185);
+              private final int cyan = Color.rgb(76, 213, 234);
+              private int dp(float x) { return (int)(x*getResources().getDisplayMetrics().density+.5f); }
+              private TextView label(String text, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(text); t.setTextSize(sp); t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  t.setPadding(0, dp(5), 0, dp(5));
+                  return t;
+              }
+              private GradientDrawable panel() {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(Color.rgb(14, 28, 42)); d.setCornerRadius(dp(14));
+                  d.setStroke(dp(1), Color.rgb(34, 72, 88)); return d;
+              }
+              private void field(LinearLayout parent, String key, String value) {
+                  LinearLayout row=new LinearLayout(this);
+                  row.setOrientation(LinearLayout.VERTICAL);
+                  row.setPadding(dp(10),dp(5),dp(8),dp(6));
+                  row.addView(label(key, 11, muted, false));
+                  row.addView(label(value, 18, ink, true));
+                  parent.addView(row);
+              }
+              private static String fmt(double value, String pattern, String unit) {
+                  return AirOperationsWidgets.finite(value)?String.format(Locale.US,pattern,value)+unit:"NOT REPORTED";
+              }
+              @Override protected void onCreate(Bundle saved) {
+                  super.onCreate(saved);
+                  getWindow().setStatusBarColor(background); getWindow().setNavigationBarColor(background);
+                  ScrollView sc = new ScrollView(this);
+                  sc.setFillViewport(true); sc.setBackgroundColor(background);
+                  LinearLayout root=new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(24), dp(20), dp(30));
+                  sc.addView(root);
+                  root.addView(label("RUNNINGBALL2  /  AIRCRAFT INTELLIGENCE", 11, cyan, true));
+                  String hex=getIntent().getStringExtra("air_hex");
+                  if(hex==null)hex="";
+                  JSONObject cached=AirOperationsWidgets.lastData(this);
+                  long stamp=cached.optLong("time",0L);
+                  JSONArray entries=cached.optJSONArray("items");
+                  JSONObject aircraft=null;
+                  if(entries!=null){for(int i=0;i<entries.length();i++){
+                      JSONObject row=entries.optJSONObject(i);
+                      if(row!=null&&(hex.isEmpty()||hex.equals(row.optString("hex", "")))){aircraft=row;break;}
+                  }}
+                  String title=aircraft!=null?aircraft.optString("flight", "AIRCRAFT"):"AIRCRAFT OPERATIONS";
+                  root.addView(label(title, 29, ink, true));
+                  root.addView(label("KAMPALA COVERAGE  •  250 NM RADIUS", 12, muted, false));
+                  if(aircraft==null){
+                      root.addView(label("No cached aircraft report is available. Refresh either aircraft widget while connected.",16,muted,false));
+                      setContentView(sc);return;
+                  }
+                  LinearLayout card=new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setBackground(panel());
+                  card.setPadding(dp(8),dp(7),dp(8),dp(10));
+                  LinearLayout.LayoutParams cp=new LinearLayout.LayoutParams(-1,-2);
+                  cp.topMargin=dp(14); root.addView(card,cp);
+                  field(card,"ICAO / HEX IDENTIFIER",aircraft.optString("hex", "—"));
+                  field(card,"DISTANCE FROM KAMPALA",fmt(aircraft.optDouble("nm",Double.NaN),"%.1f"," nautical miles"));
+                  field(card,"BAROMETRIC ALTITUDE",aircraft.optBoolean("ground",false)?"ON GROUND":fmt(aircraft.optDouble("alt",Double.NaN),"%.0f"," feet"));
+                  field(card,"GROUND SPEED",fmt(aircraft.optDouble("speed",Double.NaN),"%.0f"," knots"));
+                  field(card,"HEADING (TRUE)",fmt(aircraft.optDouble("heading",Double.NaN),"%.0f"," degrees"));
+                  field(card,"LATITUDE",fmt(aircraft.optDouble("lat",Double.NaN),"%.5f","°"));
+                  field(card,"LONGITUDE",fmt(aircraft.optDouble("lon",Double.NaN),"%.5f","°"));
+                  field(card,"POSITION AGE WHEN RECEIVED",fmt(aircraft.optDouble("seen",Double.NaN),"%.0f"," seconds"));
+                  SimpleDateFormat df=new SimpleDateFormat("dd MMM yyyy  •  HH:mm:ss 'UTC'",Locale.US);
+                  df.setTimeZone(TimeZone.getTimeZone("UTC"));
+                  root.addView(label("SNAPSHOT: "+(stamp>0?df.format(new Date(stamp)):"NOT AVAILABLE"),12,cyan,true));
+                  long age=stamp<=0?Long.MAX_VALUE:Math.max(0,System.currentTimeMillis()-stamp);
+                  root.addView(label(age>180_000L?"CACHED REPORT — DO NOT TREAT AS A LIVE POSITION":"RECENT REPORT — POSITION MAY HAVE CHANGED",12,age>180_000L?Color.rgb(250,192,91):cyan,true));
+                  root.addView(label("SOURCE: ADSB.LOL. Positions are received reports; coverage, altitude and speed may be unavailable or delayed. No predicted movement is shown.",12,muted,false));
+                  TextView back=label("←  CLOSE DETAILS",14,cyan,true);
+                  back.setGravity(Gravity.CENTER);
+                  back.setBackground(panel());
+                  back.setPadding(dp(12),dp(13),dp(12),dp(13));
+                  back.setOnClickListener(new View.OnClickListener(){@Override public void onClick(View v){finish();}});
+                  LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-1,-2);bp.topMargin=dp(20);root.addView(back,bp);
+                  setContentView(sc);
+              }
+          }
+          RB_WIDGET_01
+
+          mkdir -p "$(dirname "$RES/layout/rb_air_command.xml")"
+          cat > "$RES/layout/rb_air_command.xml" <<'RB_WIDGET_02'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+           android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical"
+           android:background="@drawable/rb_air_bg" android:padding="12dp">
+           <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+             <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical">
+               <TextView android:text="✈  AIRCRAFT COMMAND" android:layout_width="match_parent" android:layout_height="wrap_content"
+                 android:textColor="#E8F8FF" android:textSize="14sp" android:textStyle="bold" android:fontFamily="sans"/>
+               <TextView android:text="KAMPALA  •  250 NM COVERAGE" android:layout_width="match_parent" android:layout_height="wrap_content"
+                 android:textColor="#82A7BD" android:textSize="9sp" android:layout_marginTop="2dp"/>
+             </LinearLayout>
+             <TextView android:id="@+id/rb_air_command_state" android:text="WAITING" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                 android:textColor="#54CDE5" android:textSize="10sp" android:textStyle="bold" android:paddingEnd="9dp"/>
+             <TextView android:id="@+id/rb_air_command_refresh" android:layout_width="32dp" android:layout_height="30dp"
+                 android:gravity="center" android:text="↻" android:textColor="#E2F4FA" android:textSize="22sp"
+                 android:background="@drawable/rb_air_button" android:contentDescription="Refresh aircraft report"/>
+           </LinearLayout>
+           <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:layout_marginTop="8dp" android:baselineAligned="false">
+             <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="53dp" android:gravity="center" android:orientation="vertical" android:background="@drawable/rb_air_tile" android:layout_marginEnd="4dp">
+               <TextView android:id="@+id/rb_air_command_count" android:text="--" android:textSize="22sp" android:textStyle="bold" android:textColor="#F2FAFF" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+               <TextView android:text="REPORTED" android:textSize="9sp" android:textColor="#7FADC0" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+             </LinearLayout>
+             <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="53dp" android:gravity="center" android:orientation="vertical" android:background="@drawable/rb_air_tile" android:layout_marginEnd="4dp">
+               <TextView android:id="@+id/rb_air_command_moving" android:text="--" android:textSize="22sp" android:textStyle="bold" android:textColor="#F2FAFF" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+               <TextView android:text="MOVING" android:textSize="9sp" android:textColor="#7FADC0" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+             </LinearLayout>
+             <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="53dp" android:gravity="center" android:orientation="vertical" android:background="@drawable/rb_air_tile" android:layout_marginEnd="4dp">
+               <TextView android:id="@+id/rb_air_command_ground" android:text="--" android:textSize="22sp" android:textStyle="bold" android:textColor="#F2FAFF" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+               <TextView android:text="GROUND" android:textSize="9sp" android:textColor="#7FADC0" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+             </LinearLayout>
+           </LinearLayout>
+           <TextView android:text="NEAREST REPORTED FLIGHTS" android:layout_width="match_parent" android:layout_height="wrap_content"
+             android:textColor="#58CFE6" android:textSize="10sp" android:textStyle="bold" android:layout_marginTop="10dp" android:layout_marginBottom="5dp"/>
+           <LinearLayout android:id="@+id/rb_air_row1" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                android:gravity="center_vertical" android:orientation="vertical" android:paddingStart="10dp" android:paddingEnd="8dp"
+                android:layout_marginBottom="4dp" android:background="@drawable/rb_air_tile">
+              <TextView android:id="@+id/rb_air_call1" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="AWAITING AIRCRAFT"
+                android:textColor="#EAF8FF" android:textSize="11sp" android:textStyle="bold" android:maxLines="1" android:ellipsize="end"/>
+              <TextView android:id="@+id/rb_air_stat1" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="—"
+                android:textColor="#A4BECE" android:textSize="9sp" android:maxLines="1" android:ellipsize="end"/>
+           </LinearLayout>
+           <LinearLayout android:id="@+id/rb_air_row2" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                android:gravity="center_vertical" android:orientation="vertical" android:paddingStart="10dp" android:paddingEnd="8dp"
+                android:layout_marginBottom="4dp" android:background="@drawable/rb_air_tile">
+              <TextView android:id="@+id/rb_air_call2" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="AWAITING AIRCRAFT"
+                android:textColor="#EAF8FF" android:textSize="11sp" android:textStyle="bold" android:maxLines="1" android:ellipsize="end"/>
+              <TextView android:id="@+id/rb_air_stat2" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="—"
+                android:textColor="#A4BECE" android:textSize="9sp" android:maxLines="1" android:ellipsize="end"/>
+           </LinearLayout>
+           <LinearLayout android:id="@+id/rb_air_row3" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                android:gravity="center_vertical" android:orientation="vertical" android:paddingStart="10dp" android:paddingEnd="8dp"
+                android:layout_marginBottom="4dp" android:background="@drawable/rb_air_tile">
+              <TextView android:id="@+id/rb_air_call3" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="AWAITING AIRCRAFT"
+                android:textColor="#EAF8FF" android:textSize="11sp" android:textStyle="bold" android:maxLines="1" android:ellipsize="end"/>
+              <TextView android:id="@+id/rb_air_stat3" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="—"
+                android:textColor="#A4BECE" android:textSize="9sp" android:maxLines="1" android:ellipsize="end"/>
+           </LinearLayout>
+           <TextView android:id="@+id/rb_air_command_fix" android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:text="NO REPORT YET" android:textColor="#66CFE8" android:textSize="10sp" android:textStyle="bold" android:paddingTop="4dp"/>
+           <TextView android:id="@+id/rb_air_command_provider" android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:text="SOURCE: ADSB.LOL  •  REPORTS ONLY" android:textColor="#86A9BC" android:textSize="9sp" android:paddingTop="2dp"
+              android:maxLines="1" android:ellipsize="end"/>
+          </LinearLayout>
+          RB_WIDGET_02
+
+          mkdir -p "$(dirname "$RES/layout/rb_air_pulse.xml")"
+          cat > "$RES/layout/rb_air_pulse.xml" <<'RB_WIDGET_03'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+           android:layout_width="match_parent" android:layout_height="match_parent" android:orientation="vertical"
+           android:background="@drawable/rb_air_bg" android:padding="12dp">
+           <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+             <TextView android:id="@+id/rb_air_pulse_open" android:layout_width="0dp" android:layout_weight="1"
+                android:layout_height="wrap_content" android:text="✈  AIR PULSE" android:textColor="#54CDE5" android:textSize="12sp" android:textStyle="bold" android:fontFamily="sans"/>
+             <TextView android:id="@+id/rb_air_pulse_refresh" android:layout_width="32dp" android:layout_height="30dp"
+                 android:gravity="center" android:text="↻" android:textColor="#E2F4FA" android:textSize="22sp"
+                 android:background="@drawable/rb_air_button" android:contentDescription="Refresh aircraft report"/>
+           </LinearLayout>
+           <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                 android:orientation="horizontal" android:gravity="center_vertical">
+             <TextView android:id="@+id/rb_air_pulse_count" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                 android:text="--" android:textColor="#F0FAFF" android:textSize="38sp" android:textStyle="bold"
+                 android:fontFamily="sans" android:paddingEnd="13dp"/>
+             <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="vertical">
+               <TextView android:text="REPORTED" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                 android:textColor="#8CB0BF" android:textSize="10sp" android:textStyle="bold"/>
+               <TextView android:id="@+id/rb_air_pulse_moving" android:text="-- MOVING" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                 android:textColor="#56DDB0" android:textSize="11sp" android:textStyle="bold"/>
+             </LinearLayout>
+           </LinearLayout>
+           <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+             <TextView android:id="@+id/rb_air_pulse_state" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                 android:text="WAITING" android:textColor="#54CDE5" android:textSize="10sp" android:textStyle="bold"/>
+             <TextView android:id="@+id/rb_air_pulse_fix" android:layout_width="0dp" android:layout_weight="1"
+                 android:layout_height="wrap_content" android:text="NO REPORT YET" android:textColor="#90AABB" android:textSize="9sp"
+                 android:gravity="end" android:maxLines="1" android:ellipsize="end"/>
+           </LinearLayout>
+          </LinearLayout>
+          RB_WIDGET_03
+
+          mkdir -p "$(dirname "$RES/drawable/rb_air_tile.xml")"
+          cat > "$RES/drawable/rb_air_tile.xml" <<'RB_WIDGET_04'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+            <solid android:color="#152A3C"/><corners android:radius="9dp"/>
+            <stroke android:width="1dp" android:color="#235169"/>
+          </shape>
+          RB_WIDGET_04
+
+          mkdir -p "$(dirname "$RES/drawable/rb_air_button.xml")"
+          cat > "$RES/drawable/rb_air_button.xml" <<'RB_WIDGET_05'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+            <solid android:color="#184056"/><corners android:radius="8dp"/>
+            <stroke android:width="1dp" android:color="#377C94"/>
+          </shape>
+          RB_WIDGET_05
+
+          mkdir -p "$(dirname "$RES/drawable/rb_air_bg.xml")"
+          cat > "$RES/drawable/rb_air_bg.xml" <<'RB_WIDGET_06'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+            <gradient android:startColor="#08111F" android:centerColor="#101F32" android:endColor="#07111F" android:angle="0"/>
+            <corners android:radius="18dp"/>
+            <stroke android:width="1dp" android:color="#245C6C"/>
+          </shape>
+          RB_WIDGET_06
+
+          mkdir -p "$(dirname "$RES/xml/rb_air_command_info.xml")"
+          cat > "$RES/xml/rb_air_command_info.xml" <<'RB_WIDGET_07'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+           android:minWidth="290dp" android:minHeight="245dp" android:minResizeWidth="260dp" android:minResizeHeight="230dp"
+           android:initialLayout="@layout/rb_air_command" android:updatePeriodMillis="1800000"
+           android:resizeMode="horizontal|vertical" android:widgetCategory="home_screen" />
+          RB_WIDGET_07
+
+          mkdir -p "$(dirname "$RES/xml/rb_air_pulse_info.xml")"
+          cat > "$RES/xml/rb_air_pulse_info.xml" <<'RB_WIDGET_08'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+           android:minWidth="180dp" android:minHeight="105dp" android:minResizeWidth="165dp" android:minResizeHeight="100dp"
+           android:initialLayout="@layout/rb_air_pulse" android:updatePeriodMillis="1800000"
+           android:resizeMode="horizontal|vertical" android:widgetCategory="home_screen" />
+          RB_WIDGET_08
+
+          python3 - "$MANIFEST" <<'PY_AIRWIDGETS_MANIFEST'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding='utf-8')
+          if 'AirOperationsWidgets$Pulse' in text:
+              raise SystemExit('Widget providers already exist; patch refused to avoid duplication')
+          insertion = """
+              <receiver android:name=".AirOperationsWidgets$Pulse" android:exported="true" android:label="RUNNINGBALL2 Aircraft Pulse">
+                  <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+                  <meta-data android:name="android.appwidget.provider" android:resource="@xml/rb_air_pulse_info" />
+              </receiver>
+              <receiver android:name=".AirOperationsWidgets$Command" android:exported="true" android:label="RUNNINGBALL2 Aircraft Command">
+                  <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+                  <meta-data android:name="android.appwidget.provider" android:resource="@xml/rb_air_command_info" />
+              </receiver>
+              <activity android:name=".AirFlightDetailsActivity" android:exported="false" />
+          """
+          anchor = '</application>'
+          if text.count(anchor)!=1: raise SystemExit('Manifest structure does not match protected baseline')
+          path.write_text(text.replace(anchor, insertion+anchor, 1), encoding='utf-8')
+          print('Two new home-screen widgets and details activity registered; old widgets retained')
+          PY_AIRWIDGETS_MANIFEST
+
+      - name: AIR WIDGETS V3 - dense responsive pulse and detailed flight cards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PY_WIDGET_POLISH'
+          from pathlib import Path
+          import sys, re, xml.etree.ElementTree as ET
+          root = Path(sys.argv[1])
+          package = root / 'app/src/main/java/com/sentongoharuna/worldsituationroom'
+          res = root / 'app/src/main/res'
+          java = package / 'AirOperationsWidgets.java'
+          text = java.read_text(encoding='utf-8')
+          assert 'class Pulse extends AirOperationsWidgets' in text
+          assert 'class Command extends AirOperationsWidgets' in text
+          assert 'private static final long MIN_RETRY_MS = 45_000L;' in text
+          assert 'new URL(FEED)' in text and 'goAsync()' in text
+          def change_once(old, new, label):
+              global text
+              # GitHub YAML strips the block indentation from embedded Java literals.
+              # Restore exactly ten spaces to every continuation line of those literals.
+              if label in ("responsive aircraft pulse records and refresh", "command row heading details"):
+                  def restore_indent(value):
+                      lines = value.split("\n")
+                      return lines[0] + "".join("\n" + (" " * 10) + x for x in lines[1:])
+                  old = restore_indent(old)
+                  new = restore_indent(new)
+              n = text.count(old)
+              if n != 1:
+                  raise SystemExit(f'Protected widget patch mismatch {label}: expected one, got {n}')
+              text = text.replace(old, new, 1)
+              print('AIR V3 changed:', label)
+          # Do not touch network ingestion, historical reporting, wallpaper or rendering.
+          change_once('''            rv.setTextViewText(R.id.rb_air_pulse_fix, when);
+            rv.setOnClickPendingIntent(R.id.rb_air_pulse_refresh,''', '''            rv.setTextViewText(R.id.rb_air_pulse_fix, when);
+            rv.setTextViewText(R.id.rb_air_pulse_ground, stamp == 0 ? "-- GROUND" : ground + " GROUND");
+            android.os.Bundle options = manager.getAppWidgetOptions(id);
+            int heightDp = Math.max(options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 0),
+                                    options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 0));
+            // The 2x2 home widget stays compact; a tall widget reveals useful flight details.
+            rv.setViewVisibility(R.id.rb_air_pulse_metrics,
+                                 heightDp >= 135 ? android.view.View.VISIBLE : android.view.View.GONE);
+            rv.setViewVisibility(R.id.rb_air_pulse_extra,
+                                 heightDp >= 180 ? android.view.View.VISIBLE : android.view.View.GONE);
+            rv.setViewVisibility(R.id.rb_air_pulse_row2,
+                                 heightDp >= 245 ? android.view.View.VISIBLE : android.view.View.GONE);
+            int[] pRows = {R.id.rb_air_pulse_row1, R.id.rb_air_pulse_row2};
+            int[] pNames = {R.id.rb_air_pulse_call1, R.id.rb_air_pulse_call2};
+            int[] pStats = {R.id.rb_air_pulse_stat1, R.id.rb_air_pulse_stat2};
+            for (int index = 0; index < pRows.length; index++) {
+                JSONObject flight = aircraft == null ? null : aircraft.optJSONObject(index);
+                String hex = flight == null ? "" : flight.optString("hex", "");
+                rv.setTextViewText(pNames[index], flight == null ? "NO REPORTED FLIGHT" :
+                                   trim(flight.optString("flight", hex), 15));
+                rv.setTextViewText(pStats[index], flight == null ?
+                                   (stamp == 0 ? "AWAITING REPORT" : "NO POSITION AVAILABLE") :
+                                   fmt(flight.optDouble("nm", Double.NaN), " NM") + "   " +
+                                   (flight.optBoolean("ground", false) ? "GROUND" :
+                                    fmt(flight.optDouble("alt", Double.NaN), " FT")) + "   " +
+                                   fmt(flight.optDouble("speed", Double.NaN), " KT"));
+                rv.setOnClickPendingIntent(pRows[index], openDetail(context, 510_000 + id * 10 + index, hex));
+            }
+            rv.setOnClickPendingIntent(R.id.rb_air_pulse_refresh,''', 'responsive aircraft pulse records and refresh')
+          change_once('''                            + "  " + fmt(flight.optDouble("speed", Double.NaN), "KT"));''', '''                            + "  " + fmt(flight.optDouble("speed", Double.NaN), "KT")
+                            + "  " + fmt(flight.optDouble("heading", Double.NaN), "°"));''', 'command row heading details')
+          java.write_text(text, encoding='utf-8')
+
+          pulse_xml = r'''<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+            android:layout_width="match_parent" android:layout_height="match_parent"
+            android:orientation="vertical" android:background="@drawable/rb_air_bg" android:padding="10dp">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:gravity="center_vertical">
+              <LinearLayout android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:orientation="vertical">
+                <TextView android:id="@+id/rb_air_pulse_open" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="✈  AIR PULSE" android:textColor="#65DDF3" android:textSize="12sp" android:textStyle="bold"
+                    android:fontFamily="sans" android:singleLine="true"/>
+                <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="KAMPALA · 250 NM" android:textColor="#8EACBE" android:textSize="9sp" android:layout_marginTop="2dp"/>
+              </LinearLayout>
+              <TextView android:id="@+id/rb_air_pulse_refresh" android:layout_width="32dp" android:layout_height="32dp"
+                  android:gravity="center" android:text="↻" android:textColor="#E2F4FA" android:textSize="23sp"
+                  android:background="@drawable/rb_air_button" android:contentDescription="Refresh aircraft report"/>
+            </LinearLayout>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:gravity="center_vertical" android:orientation="horizontal" android:layout_marginTop="7dp"
+                android:background="@drawable/rb_air_tile" android:paddingStart="10dp" android:paddingEnd="6dp" android:paddingTop="4dp" android:paddingBottom="4dp">
+              <TextView android:id="@+id/rb_air_pulse_count" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="--" android:textColor="#F1FAFF" android:textSize="38sp" android:textStyle="bold" android:paddingEnd="13dp"/>
+              <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="vertical">
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="AIRCRAFT"
+                    android:textColor="#A9C5D3" android:textSize="10sp" android:textStyle="bold"/>
+                <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="REPORTED IN RANGE"
+                    android:textColor="#7D9FB3" android:textSize="8sp"/>
+              </LinearLayout>
+            </LinearLayout>
+            <LinearLayout android:id="@+id/rb_air_pulse_metrics" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="horizontal" android:layout_marginTop="6dp"
+                android:visibility="gone">
+              <TextView android:id="@+id/rb_air_pulse_moving" android:layout_width="0dp" android:layout_weight="1"
+                  android:layout_height="31dp" android:gravity="center" android:background="@drawable/rb_air_tile"
+                  android:text="-- MOVING" android:textColor="#65DFB7" android:textSize="11sp" android:textStyle="bold"
+                  android:layout_marginEnd="4dp"/>
+              <TextView android:id="@+id/rb_air_pulse_ground" android:layout_width="0dp" android:layout_weight="1"
+                  android:layout_height="31dp" android:gravity="center" android:background="@drawable/rb_air_tile"
+                  android:text="-- GROUND" android:textColor="#B0C6D4" android:textSize="11sp" android:textStyle="bold"/>
+            </LinearLayout>
+            <LinearLayout android:id="@+id/rb_air_pulse_extra" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="vertical"
+                android:layout_marginTop="7dp" android:visibility="gone">
+              <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:text="NEAREST REPORTED" android:textSize="9sp" android:textStyle="bold"
+                  android:textColor="#6AD8ED" android:layout_marginBottom="3dp"/>
+              <LinearLayout android:id="@+id/rb_air_pulse_row1" android:layout_width="match_parent"
+                  android:layout_height="46dp" android:orientation="vertical" android:gravity="center_vertical"
+                  android:paddingStart="9dp" android:paddingEnd="6dp" android:background="@drawable/rb_air_tile"
+                  android:layout_marginBottom="4dp">
+                <TextView android:id="@+id/rb_air_pulse_call1" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="AWAITING AIRCRAFT" android:textColor="#EDF9FE" android:textSize="11sp" android:textStyle="bold"
+                    android:maxLines="1" android:ellipsize="end"/>
+                <TextView android:id="@+id/rb_air_pulse_stat1" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="NO REPORT YET" android:textColor="#A8C0CC" android:textSize="9sp"
+                    android:maxLines="1" android:ellipsize="end"/>
+              </LinearLayout>
+              <LinearLayout android:id="@+id/rb_air_pulse_row2" android:layout_width="match_parent"
+                  android:layout_height="46dp" android:orientation="vertical" android:gravity="center_vertical"
+                  android:paddingStart="9dp" android:paddingEnd="6dp" android:background="@drawable/rb_air_tile"
+                  android:layout_marginBottom="4dp" android:visibility="gone">
+                <TextView android:id="@+id/rb_air_pulse_call2" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="AWAITING AIRCRAFT" android:textColor="#EDF9FE" android:textSize="11sp" android:textStyle="bold"
+                    android:maxLines="1" android:ellipsize="end"/>
+                <TextView android:id="@+id/rb_air_pulse_stat2" android:layout_width="match_parent" android:layout_height="wrap_content"
+                    android:text="NO REPORT YET" android:textColor="#A8C0CC" android:textSize="9sp"
+                    android:maxLines="1" android:ellipsize="end"/>
+              </LinearLayout>
+            </LinearLayout>
+            <TextView android:layout_width="1dp" android:layout_height="0dp" android:layout_weight="1"/>
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:gravity="center_vertical" android:orientation="horizontal" android:paddingTop="5dp">
+              <TextView android:id="@+id/rb_air_pulse_state" android:layout_width="wrap_content"
+                  android:layout_height="wrap_content" android:text="WAITING" android:textColor="#63DBAE"
+                  android:textSize="10sp" android:textStyle="bold" android:paddingEnd="8dp"/>
+              <TextView android:id="@+id/rb_air_pulse_fix" android:layout_width="0dp" android:layout_weight="1"
+                  android:layout_height="wrap_content" android:text="NO REPORT YET" android:textColor="#9FB6C6"
+                  android:gravity="end" android:textSize="9sp" android:maxLines="1" android:ellipsize="end"/>
+            </LinearLayout>
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="SOURCE ADSB.LOL · TAP FLIGHT" android:textColor="#6E94A9"
+                android:textSize="8sp" android:layout_marginTop="3dp" android:maxLines="1"/>
+          </LinearLayout>'''
+          pulse_path=res/'layout/rb_air_pulse.xml'
+          pulse_path.write_text(pulse_xml, encoding='utf-8')
+          ET.parse(pulse_path)
+          pulse_info = res/'xml/rb_air_pulse_info.xml'
+          info = pulse_info.read_text(encoding='utf-8')
+          assert info.count('android:minHeight="105dp"') == 1
+          assert info.count('android:minResizeHeight="100dp"') == 1
+          info = info.replace('android:minHeight="105dp"', 'android:minHeight="145dp"', 1)
+          info = info.replace('android:minResizeHeight="100dp"', 'android:minResizeHeight="140dp"', 1)
+          pulse_info.write_text(info, encoding='utf-8')
+          ET.parse(pulse_info)
+
+          # Other detailed widget: use compact, readable flight rows instead of stretching them.
+          command_path=res/'layout/rb_air_command.xml'
+          command=command_path.read_text(encoding='utf-8')
+          for n in (1,2,3):
+              tag=f'android:id="@+id/rb_air_row{n}" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"'
+              if command.count(tag)!=1: raise SystemExit(f'Command row {n} contract unexpectedly changed')
+              command=command.replace(tag, f'android:id="@+id/rb_air_row{n}" android:layout_width="match_parent" android:layout_height="58dp"', 1)
+          command=command.replace('android:text="NEAREST REPORTED FLIGHTS"', 'android:text="NEAREST AIRCRAFT · TAP FOR DETAILS"')
+          assert 'AIRCRAFT COMMAND' in command
+          command_path.write_text(command, encoding='utf-8')
+          ET.parse(command_path)
+          # Guard against XML elements whose ids the RemoteViews code expects.
+          for path,ids in ((pulse_path, ['rb_air_pulse_refresh','rb_air_pulse_count','rb_air_pulse_moving',
+                       'rb_air_pulse_ground','rb_air_pulse_row1','rb_air_pulse_row2',
+                       'rb_air_pulse_call1','rb_air_pulse_stat1','rb_air_pulse_call2','rb_air_pulse_stat2',
+                       'rb_air_pulse_extra','rb_air_pulse_metrics','rb_air_pulse_fix','rb_air_pulse_state']),
+                       (command_path, ['rb_air_row1','rb_air_row2','rb_air_row3'])):
+              xml=path.read_text(encoding='utf-8')
+              for identifier in ids:
+                  assert xml.count('@+id/'+identifier)==1, f'Missing/repeated widget id: {identifier}'
+          live=(package/'DuwmLiveWallpaperService.java').read_text(encoding='utf-8')
+          for invariant in ('FRAME_MS=33L','rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;',
+                            'h.lockCanvas()', 'h.unlockCanvasAndPost(c)'):
+              assert invariant in live, 'STOP: working globe rotation changed: '+invariant
+          print('V3: responsive widgets, actual aircraft details, original live globe preserved')
+          PY_WIDGET_POLISH
+
+      - name: AIR COMMAND V4 - fact-based mini radar, freshness and responsive widgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PY_AIR_V4'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import sys, re, textwrap
+          root=Path(sys.argv[1])
+          main=root/'app/src/main'
+          pkg=main/'java/com/sentongoharuna/worldsituationroom'
+          layout=main/'res/layout'
+          widgets=pkg/'AirOperationsWidgets.java'
+          source=widgets.read_text(encoding='utf-8')
+          assert 'class Pulse extends AirOperationsWidgets' in source and 'class Command extends AirOperationsWidgets' in source
+          assert 'private static final String FEED = "https://api.adsb.lol/v2/point/0.3476/32.5825/250"' in source
+          assert 'private static final long MIN_RETRY_MS = 45_000L;' in source
+          assert 'private static void renderAll(Context context)' in source
+          
+          def replace_once(old,new,label):
+              global source
+              count=source.count(old)
+              if count!=1:raise ValueError(f'V4 FAIL CLOSED {label}: {count} matches')
+              source=source.replace(old,new,1)
+              print('V4 patch:',label)
+          
+          replace_once('import android.graphics.Color;', '''import android.graphics.Color;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;''','isolated radar imports')
+          replace_once('''            rv.setTextViewText(R.id.rb_air_command_provider,
+                              error.isEmpty() ? "SOURCE  ADSB.LOL  •  REPORTS ONLY" : "SOURCE  " + error + "  •  LAST KNOWN");''','''            rv.setTextViewText(R.id.rb_air_command_provider,
+                              error.isEmpty() ? "SOURCE ADSB.LOL  •  OBSERVED POSITIONS" : "SOURCE " + error + "  •  CACHED POSITIONS");
+                      rv.setTextViewText(R.id.rb_air_command_age, ageLabel(age, stamp));
+                      rv.setTextColor(R.id.rb_air_command_age, statusColor);
+                      rv.setImageViewBitmap(R.id.rb_air_command_radar, radarImage(aircraft, stamp, count));
+                      android.os.Bundle sizeOptions = manager.getAppWidgetOptions(id);
+                      int availableHeight = Math.max(sizeOptions.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 0),
+                                                     sizeOptions.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 0));
+                      rv.setViewVisibility(R.id.rb_air_command_radar, availableHeight >= 270 ? android.view.View.VISIBLE : android.view.View.GONE);
+                      rv.setViewVisibility(R.id.rb_air_row2, availableHeight >= 285 ? android.view.View.VISIBLE : android.view.View.GONE);
+                      rv.setViewVisibility(R.id.rb_air_row3, availableHeight >= 355 ? android.view.View.VISIBLE : android.view.View.GONE);''','command radar, data-age and height-aware flight rows')
+          replace_once('''            rv.setTextViewText(R.id.rb_air_pulse_fix, when);''','''            rv.setTextViewText(R.id.rb_air_pulse_fix, ageLabel(age, stamp) + "  •  " + when);''','pulse data-age and time')
+          replace_once('''                            + "  " + fmt(flight.optDouble("heading", Double.NaN), "°"));''','''                            + "  HDG " + fmt(flight.optDouble("heading", Double.NaN), "°"));''','explicit heading label')
+          
+          method=r'''    /** Snapshot age is calculated locally; no claim of continuous live tracking. */
+              private static String ageLabel(long ageMs, long timestamp) {
+                  if (timestamp <= 0L) return "NO DATA";
+                  if (ageMs < 60_000L) return "AGE " + Math.max(0L, ageMs / 1000L) + "S";
+                  if (ageMs < 3_600_000L) return "AGE " + ageMs / 60_000L + "M";
+                  return "AGE " + ageMs / 3_600_000L + "H";
+              }
+          
+              /** Real, finite provider positions only; snapshot radar never predicts tracks. */
+              private static Bitmap radarImage(JSONArray flights, long timestamp, int total) {
+                  final int width = 540, height = 148;
+                  Bitmap bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                  Canvas canvas = new Canvas(bmp);
+                  canvas.drawColor(Color.rgb(9, 22, 35));
+                  Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  final float cx = 88f, cy = 74f, radius = 58f;
+                  p.setStyle(Paint.Style.STROKE);
+                  p.setStrokeWidth(1.8f);
+                  p.setColor(Color.argb(155, 49, 132, 160));
+                  for (int ring=1; ring<=3; ring++) canvas.drawCircle(cx,cy,radius*ring/3f,p);
+                  p.setColor(Color.argb(120, 45, 116, 146));
+                  canvas.drawLine(cx-radius,cy,cx+radius,cy,p);
+                  canvas.drawLine(cx,cy-radius,cx,cy+radius,p);
+                  p.setStyle(Paint.Style.FILL);
+                  p.setColor(Color.rgb(97, 215, 238));
+                  p.setTextSize(15f);
+                  canvas.drawText("N",cx-6f,cy-radius-6f,p);
+                  p.setColor(Color.rgb(75, 221, 171));
+                  canvas.drawCircle(cx,cy,4f,p);
+                  int plotted=0;
+                  if (flights!=null && timestamp>0) for(int i=0; i<flights.length() && i<8; i++) {
+                      JSONObject item=flights.optJSONObject(i);
+                      if(item==null)continue;
+                      double la=item.optDouble("lat",Double.NaN), lo=item.optDouble("lon",Double.NaN);
+                      if(!finite(la) || !finite(lo))continue;
+                      double north=(la-0.3476d)*60d;
+                      double east=(lo-32.5825d)*60d*Math.cos(Math.toRadians(0.3476d));
+                      double nm=Math.hypot(north,east);
+                      if(nm>250d)continue;
+                      p.setColor(item.optBoolean("ground",false)?Color.rgb(168,186,199):Color.rgb(88,222,190));
+                      canvas.drawCircle(cx+(float)(east/250d*radius),cy-(float)(north/250d*radius),5f,p);
+                      plotted++;
+                  }
+                  p.setColor(Color.rgb(101, 213, 236));p.setTextSize(19f);p.setFakeBoldText(true);
+                  canvas.drawText("KAMPALA AIRSPACE",178f,38f,p);
+                  p.setFakeBoldText(false);p.setTextSize(16f);p.setColor(Color.rgb(174,199,214));
+                  canvas.drawText("250 NM  •  POSITION SNAPSHOT",178f,68f,p);
+                  canvas.drawText(timestamp<=0?"AWAITING ADS-B REPORT":plotted+" PLOTTED / "+total+" REPORTED",178f,100f,p);
+                  p.setTextSize(13f);p.setColor(Color.rgb(103,148,172));
+                  canvas.drawText("NO PREDICTED AIRCRAFT MOVEMENT",178f,125f,p);
+                  return bmp;
+              }
+          
+          '''
+          replace_once('    private static PendingIntent refreshIntent(',method+'    private static PendingIntent refreshIntent(','bitmap radar from observed data')
+          widgets.write_text(source,encoding='utf-8')
+          
+          cmd=layout/'rb_air_command.xml'
+          xml=cmd.read_text(encoding='utf-8')
+          assert xml.count('android:id="@+id/rb_air_command_state"')==1
+          assert xml.count('android:id="@+id/rb_air_command_fix"')==1
+          # Use compact counts and more structured information with no fake movement.
+          xml=xml.replace('android:layout_height="53dp"','android:layout_height="48dp"')
+          xml=xml.replace('android:textSize="22sp"','android:textSize="23sp"')
+          xml=xml.replace('android:text="NEAREST AIRCRAFT · TAP FOR DETAILS"','android:text="NEAREST REPORTED FLIGHTS  /  TAP TO INSPECT"')
+          for ix in (1,2,3):
+              xml=xml.replace(f'android:id="@+id/rb_air_row{ix}" android:layout_width="match_parent" android:layout_height="58dp"', f'android:id="@+id/rb_air_row{ix}" android:layout_width="match_parent" android:layout_height="49dp"')
+          anchor=' <TextView android:text="NEAREST REPORTED FLIGHTS  /  TAP TO INSPECT"'
+          assert xml.count(anchor)==1
+          radar=''' <ImageView android:id="@+id/rb_air_command_radar" android:layout_width="match_parent"
+             android:layout_height="82dp" android:layout_marginTop="6dp" android:visibility="gone"
+             android:scaleType="fitXY" android:contentDescription="Observed aircraft positions in Kampala 250-nautical-mile radius"/>
+           <TextView android:id="@+id/rb_air_command_age" android:layout_width="match_parent"
+             android:layout_height="wrap_content" android:text="NO DATA" android:textColor="#65DDF3"
+             android:textSize="9sp" android:textStyle="bold" android:gravity="end" android:layout_marginTop="4dp"/>
+          '''
+          xml=xml.replace(anchor,radar+anchor,1)
+          cmd.write_text(xml,encoding='utf-8')
+          info=main/'res/xml/rb_air_command_info.xml'
+          s=info.read_text(encoding='utf-8')
+          assert 'android:minHeight="245dp"' in s
+          s=s.replace('android:minHeight="245dp"','android:minHeight="320dp"',1)
+          info.write_text(s,encoding='utf-8')
+          # Compact and readable footer, no invented activity or synthetic feeds
+          pulse=layout/'rb_air_pulse.xml'
+          s=pulse.read_text(encoding='utf-8')
+          assert 'android:text="SOURCE ADSB.LOL · TAP FLIGHT"' in s
+          s=s.replace('android:text="SOURCE ADSB.LOL · TAP FLIGHT"','android:text="ADSB.LOL · REPORTED POSITIONS ONLY"',1)
+          pulse.write_text(s,encoding='utf-8')
+          for path in (cmd,info,pulse): ET.parse(path)
+          for identifier in ['rb_air_command_radar','rb_air_command_age','rb_air_row1','rb_air_row2','rb_air_row3']:
+              assert xml.count('@+id/'+identifier)==1,identifier
+          # No mutation of wallpaper, source ingestion, source attribution or provider list
+          wallpaper=(pkg/'DuwmLiveWallpaperService.java').read_text(encoding='utf-8')
+          for invariant in ('FRAME_MS=33L','rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;', 'h.lockCanvas()', 'h.unlockCanvasAndPost(c)'):
+              assert invariant in wallpaper,'Globe motion base changed: '+invariant
+          assert source.count('private static Bitmap radarImage(')==1
+          assert source.count('getAppWidgetOptions(id)')>=2
+          print('V4 verified: factual radar, aircraft rows, responsive status, original wallpaper preserved')
+          PY_AIR_V4
+
+      - name: Verify actual aircraft widget contracts, source integrity and layouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          RES="$PROJECT_DIR/app/src/main/res"
+          python3 - "$PROJECT_DIR" <<'PY_AIRWIDGETS_CHECK'
+          from pathlib import Path
+          import sys, re, xml.etree.ElementTree as ET
+          root = Path(sys.argv[1]); pkg = root/'app/src/main/java/com/sentongoharuna/worldsituationroom'
+          res = root/'app/src/main/res'; xml = root/'app/src/main/AndroidManifest.xml'
+          text = (pkg/'DuwmLiveWallpaperService.java').read_text()
+          for signature in ('FRAME_MS=33L','rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;',
+                            'h.lockCanvas()', 'h.unlockCanvasAndPost(c)', 'air.draw(c);'):
+              assert signature in text, 'The proven rotating globe was changed: '+signature
+          manifest = ET.parse(xml)
+          names = [e.attrib.get('{http://schemas.android.com/apk/res/android}name') for e in manifest.iter()]
+          for name in ('.AirOperationsWidgets$Pulse','.AirOperationsWidgets$Command','.AirFlightDetailsActivity'):
+              assert names.count(name)==1, 'Widget provider/detail missing or repeated: '+name
+          for name in ('rb_air_pulse','rb_air_command'):
+              layout = res/'layout'/f'{name}.xml'
+              assert layout.is_file(); ET.parse(layout)
+          for name in ('rb_air_pulse_info','rb_air_command_info'):
+              path=res/'xml'/f'{name}.xml'; ET.parse(path)
+              assert '1800000' in path.read_text(), 'Widget auto-refresh must respect Android >=30 min rule'
+          for name in ('rb_air_bg','rb_air_tile','rb_air_button'):
+              ET.parse(res/'drawable'/f'{name}.xml')
+          widgets=(pkg/'AirOperationsWidgets.java').read_text()
+          details=(pkg/'AirFlightDetailsActivity.java').read_text()
+          assert 'goAsync()' in widgets and 'ExecutorService' in widgets and 'setOnClickPendingIntent' in widgets
+          assert 'new URL(FEED)' in widgets and 'android.os.SystemClock.elapsedRealtime()' in widgets
+          assert 'SOURCE: ADSB.LOL' in details and 'CACHED POSITIONS' in widgets
+          assert (pkg/'DuwmAircraftIntelligence.java').is_file()
+          print('Widget XML, manifest, source refresh, tap-through and 33 ms globe invariants all verified')
+          PY_AIRWIDGETS_CHECK
+
+      - name: RUNNINGBALL2 wallpaper acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          MANIFEST="$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -s "$PKG/DuwmLiveWallpaperService.java"
+          test -s "$PKG/LiveWallpaperLauncherActivity.java"
+          grep -Fq "FRAME_MS=33L" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "if(!visible||pending)return" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "ui.removeCallbacks(tick)" "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq "ACTION_CHANGE_LIVE_WALLPAPER" "$PKG/LiveWallpaperLauncherActivity.java"
+          grep -Fq "android.permission.BIND_WALLPAPER" "$MANIFEST"
+          echo "RUNNINGBALL2 LIVE WALLPAPER ACCEPTANCE PASS"
+
+      # Only change installation identity, not the old globe or wallpaper engine.
+      - name: Unique app identity to prevent reopening an older frozen APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT_DIR" <<'PYLABEL'
+          from pathlib import Path
+          import re, sys
+          p = Path(sys.argv[1]); f = p / 'app/build.gradle.kts'
+          cfg = f.read_text(encoding='utf-8')
+          def sub_once(s, old, new):
+              if s.count(old) != 1: raise SystemExit('Identity anchor missing or repeated: ' + old)
+              return s.replace(old, new, 1)
+          cfg = sub_once(cfg, 'applicationId = "com.sentongoharuna.worldsituationroom"',
+                         'applicationId = "com.sentongoharuna.worldsituationroom.rb2aircommand4"')
+          cfg = sub_once(cfg, 'versionCode = 36', 'versionCode = 46')
+          cfg = sub_once(cfg, 'versionName = "2026-local-news"', 'versionName = "RUNNINGBALL2-AIR-CMD-V4"')
+          f.write_text(cfg, encoding='utf-8')
+          labels = p / 'app/src/main/res/values/strings.xml'
+          s = labels.read_text(encoding='utf-8')
+          s, n = re.subn(r'(<string\s+name="app_name">).*?(</string>)',
+                         r'\g<1>RUNNINGBALL2 AIR COMMAND 4\g<2>', s, count=1)
+          if n != 1: raise SystemExit('App-name label anchor missing')
+          labels.write_text(s, encoding='utf-8')
+          print('Only application identity and label changed; engine code untouched.')
+          PYLABEL
+
+      - name: Check unchanged RUNNINGBALL2 wallpaper mechanism
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$PROJECT_DIR/app/src/main/java/com/sentongoharuna/worldsituationroom"
+          grep -Fq 'private static final long FRAME_MS=33L;' "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq 'rotation=(rotation+(dt/1000.0d)*4.0d)%360.0d;' "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq 'h.lockCanvas()' "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq 'h.unlockCanvasAndPost(c)' "$PKG/DuwmLiveWallpaperService.java"
+          grep -Fq 'ui.removeCallbacks(tick)' "$PKG/DuwmLiveWallpaperService.java"
+          test "$(grep -c 'drawGlobe();' "$PKG/DuwmLiveWallpaperService.java")" -ge 1
+          echo 'RUNNINGBALL2 original surface rendering verified in source'
+
+      - name: Compile protected globe and aircraft intelligence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:compileDebugJavaWithJavac --stacktrace
+
+      - name: Assemble RUNNINGBALL2 AIR1 Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:assembleDebug --stacktrace
+
+      - name: Verify actual APK, package and signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t APKS < <(find "$PROJECT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print0)
+          test "${#APKS[@]}" -eq 1
+          APK="${APKS[0]}"
+          test -s "$APK"
+          python3 - "$APK" <<'PYAPK'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              assert z.testzip() is None
+              assert 'AndroidManifest.xml' in z.namelist()
+              assert 'classes.dex' in z.namelist()
+          PYAPK
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify "$APK"
+          PACKAGE="$("$SDK_ROOT/build-tools/36.0.0/aapt" dump badging "$APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+          test "$PACKAGE" = 'com.sentongoharuna.worldsituationroom.rb2aircommand4'
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$APK" "$RUNNER_TEMP/release/RUNNINGBALL2-AIRCRAFT-COMMAND-V4.apk"
+          sha256sum "$RUNNER_TEMP/release/RUNNINGBALL2-AIRCRAFT-COMMAND-V4.apk"
+          echo '### RUNNINGBALL2 AIRCRAFT COMMAND V4 APK compiled and signed' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The original live wallpaper runs a 33-ms drawing loop. Phone motion requires device verification.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload RUNNINGBALL2 aircraft intelligence APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RUNNINGBALL2-AIRCRAFT-COMMAND-V4-APK
+          path: ${{ runner.temp }}/release/RUNNINGBALL2-AIRCRAFT-COMMAND-V4.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Baseline Android lint report (does not mask source build failures)
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --no-configuration-cache :app:lintDebug
+
+      - name: Upload lint report when available
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RUNNINGBALL2-AIRCOMMAND4-LINT
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/lint-results-debug.*
+            ${{ env.PROJECT_DIR }}/app/build/intermediates/lint_intermediate_text_report/debug/lintReportDebug/*.txt
+          if-no-files-found: ignore
+          retention-days: 30
